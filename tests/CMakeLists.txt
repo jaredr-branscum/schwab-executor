@@ -3,6 +3,7 @@ add_executable(run_unit_tests
     test_process_runner.cpp
     test_token.cpp
     test_time.cpp
+    test_token_manager.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 

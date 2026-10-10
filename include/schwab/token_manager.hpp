@@ -1,0 +1,37 @@
+#pragma once
+
+#include "schwab/token.hpp"
+
+#include <filesystem>
+#include <optional>
+#include <string_view>
+
+namespace schwab {
+
+/**
+ * @brief Thread-safe token file persistence and JSON deserializer for Charles Schwab OAuth 2.0.
+ *
+ * Informative diagnostic logging on malformed JSON or filesystem errors.
+ * Automatically pre-bakes the Authorization header buffer so loaded tokens
+ * are immediately ready for zero-allocation execution on the hot path.
+ */
+class TokenManager {
+public:
+    /**
+     * @brief Deserializes token JSON string into an OAuthToken.
+     *
+     * @param json_content Raw JSON string (e.g. from .schwab_token.json).
+     * @return Populated and pre-baked OAuthToken, or std::nullopt if parsing fails.
+     */
+    static std::optional<OAuthToken> load_from_json(std::string_view json_content);
+
+    /**
+     * @brief Reads token file from filesystem and delegates to load_from_json.
+     *
+     * @param path Path to .schwab_token.json file.
+     * @return Populated and pre-baked OAuthToken, or std::nullopt if file is missing/unreadable.
+     */
+    static std::optional<OAuthToken> load_from_file(const std::filesystem::path& path);
+};
+
+} // namespace schwab

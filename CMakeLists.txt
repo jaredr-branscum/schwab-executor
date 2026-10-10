@@ -29,16 +29,28 @@ FetchContent_Declare(
     GIT_TAG        v3.5.2
     GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(Catch2)
+# 2. nlohmann/json for JSON parsing
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(Catch2 nlohmann_json)
 
 # Core library target
 add_library(schwab_core
     src/process_runner.cpp
     src/token.cpp
+    src/token_manager.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(schwab_core PUBLIC
+    nlohmann_json::nlohmann_json
 )
 
 # Subdirectories
