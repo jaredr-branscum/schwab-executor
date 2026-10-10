@@ -32,6 +32,27 @@ public:
      * @return Populated and pre-baked OAuthToken, or std::nullopt if file is missing/unreadable.
      */
     static std::optional<OAuthToken> load_from_file(const std::filesystem::path& path);
+
+    /**
+     * @brief Checks if valid, unexpired refresh token exists at specified path.
+     *
+     * @param path Path to token file (default: ".schwab_token.json").
+     * @return true if token file exists and refresh token is valid.
+     */
+    static bool is_authenticated(const std::filesystem::path& path = ".schwab_token.json");
+
+    /**
+     * @brief Ensures active authenticated session exists.
+     * If unauthenticated, launches interactive Python login flow.
+     *
+     * @param path Path to token file (default: ".schwab_token.json").
+     * @param python_auth_script Path to python auth helper (default: "python/auth_cli.py").
+     * @return Populated OAuthToken if authenticated, or std::nullopt if login failed.
+     */
+    static std::optional<OAuthToken> ensure_authenticated(
+        const std::filesystem::path& path = ".schwab_token.json",
+        const std::string& python_auth_script = "python/auth_cli.py"
+    );
 };
 
 } // namespace schwab

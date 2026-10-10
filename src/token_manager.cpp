@@ -1,5 +1,7 @@
 #include "schwab/token_manager.hpp"
+#include "schwab/process_runner.hpp"
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -51,6 +53,44 @@ std::optional<OAuthToken> TokenManager::load_from_file(const std::filesystem::pa
     // Read entire file into string buffer
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     return load_from_json(content);
+}
+
+bool TokenManager::is_authenticated(const std::filesystem::path& path) {
+    auto token = load_from_file(path);
+    if (!token) {
+        return false;
+    }
+    return !token->is_refresh_token_expired();
+}
+
+std::optional<OAuthToken> TokenManager::ensure_authenticated(
+    const std::filesystem::path& path,
+    const std::string& python_auth_script
+) {
+    auto token = load_from_file(path);
+    if (token && !token->is_refresh_token_expired()) {
+        // If access token expired but refresh token is valid, attempt auto-refresh
+        if (token->is_access_token_expired()) {
+            std::string refresh_cmd = "python " + python_auth_script + " --refresh";
+            auto res = ProcessRunner::execute(refresh_cmd);
+            if (res.exit_code == 0) {
+                return load_from_file(path);
+            }
+        } else {
+            return token;
+        }
+    }
+
+    // Interactive login required via console terminal
+    std::cout << "\n[AUTH] No active valid session found. Launching Charles Schwab authentication...\n";
+    std::string login_cmd = "python " + python_auth_script + " --login";
+    int exit_code = std::system(login_cmd.c_str());
+    if (exit_code != 0) {
+        std::cerr << "[ERROR] Charles Schwab authentication was cancelled or failed.\n";
+        return std::nullopt;
+    }
+
+    return load_from_file(path);
 }
 
 } // namespace schwab

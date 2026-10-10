@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "schwab/token_manager.hpp"
+#include "schwab/time.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -69,5 +70,46 @@ TEST_CASE("TokenManager loads from filesystem correctly", "[token_manager]") {
     CHECK(loaded->auth_header() == "Bearer FILE_ACCESS_TOKEN");
 
     // Clean up temporary test file
+    std::filesystem::remove(temp_path);
+}
+
+TEST_CASE("TokenManager is_authenticated accurately reports session state", "[token_manager]") {
+    // Missing file -> false
+    CHECK_FALSE(schwab::TokenManager::is_authenticated("missing_token_file_xyz.json"));
+
+    auto temp_path = std::filesystem::temp_directory_path() / "schwab_auth_check_temp.json";
+
+    // Expired refresh token -> false
+    {
+        std::ofstream out(temp_path);
+        out << R"({
+            "access_token": "TOK",
+            "refresh_token": "REF",
+            "expires_at": 1000.0,
+            "refresh_token_expires_at": 1000.0
+        })";
+    }
+    CHECK_FALSE(schwab::TokenManager::is_authenticated(temp_path));
+
+    // Valid future refresh token -> true
+    double future_refresh = schwab::epoch_seconds_now() + 604800.0;
+    double future_access = schwab::epoch_seconds_now() + 1800.0;
+    {
+        std::ofstream out(temp_path);
+        out << "{\n"
+            << "  \"access_token\": \"VALID_ACCESS\",\n"
+            << "  \"refresh_token\": \"VALID_REFRESH\",\n"
+            << "  \"expires_at\": " << std::to_string(future_access) << ",\n"
+            << "  \"refresh_token_expires_at\": " << std::to_string(future_refresh) << "\n"
+            << "}";
+    }
+    CHECK(schwab::TokenManager::is_authenticated(temp_path));
+
+    // ensure_authenticated returns active token immediately if already valid
+    auto token_opt = schwab::TokenManager::ensure_authenticated(temp_path);
+    REQUIRE(token_opt.has_value());
+    CHECK(token_opt->access_token == "VALID_ACCESS");
+    CHECK(token_opt->auth_header() == "Bearer VALID_ACCESS");
+
     std::filesystem::remove(temp_path);
 }
