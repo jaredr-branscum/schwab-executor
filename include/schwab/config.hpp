@@ -59,6 +59,15 @@ struct Config {
     /// @brief Check if a parameter exists in custom_params (noexcept, zero-allocation)
     [[nodiscard]] bool has_param(std::string_view key) const noexcept;
 
+    /// @brief Parse configuration from raw .env text string
+    [[nodiscard]] static Config load_from_string(std::string_view content);
+
+    /// @brief Load configuration from .env file with OS environment variable overrides
+    [[nodiscard]] static Config load_from_file(const std::filesystem::path& env_path = ".env");
+
+    /// @brief Apply OS environment variable overrides (e.g. std::getenv)
+    void apply_environment_overrides();
+
     /// @brief Validates configuration integrity and pre-trade risk bounds
     /// @return std::nullopt if valid, or a descriptive error message
     [[nodiscard]] std::optional<std::string> validate() const;

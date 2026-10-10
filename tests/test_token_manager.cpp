@@ -4,6 +4,21 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <sstream>
+
+namespace {
+
+// RAII helper to temporarily redirect std::cerr during intentional negative tests
+struct ScopedCerrSilencer {
+    std::stringstream dummy;
+    std::streambuf* orig{nullptr};
+
+    ScopedCerrSilencer() noexcept : orig(std::cerr.rdbuf(dummy.rdbuf())) {}
+    ~ScopedCerrSilencer() noexcept { std::cerr.rdbuf(orig); }
+};
+
+} // namespace
 
 TEST_CASE("TokenManager parses valid JSON correctly and precomputes auth header", "[token_manager]") {
     const std::string valid_json = R"({
@@ -30,6 +45,8 @@ TEST_CASE("TokenManager parses valid JSON correctly and precomputes auth header"
 }
 
 TEST_CASE("TokenManager handles corrupted or invalid JSON safely", "[token_manager]") {
+    ScopedCerrSilencer silencer;
+
     // Malformed JSON (syntax error)
     auto corrupted = schwab::TokenManager::load_from_json(R"({"access_token": "incomplete)");
     CHECK_FALSE(corrupted.has_value());
