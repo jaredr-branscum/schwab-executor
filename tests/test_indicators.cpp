@@ -153,3 +153,87 @@ TEST_CASE("Exponential Moving Average edge cases and boundary defense", "[indica
         CHECK(!ema(prices, 0).has_value());
     }
 }
+
+TEST_CASE("Realized Volatility calculation", "[indicators]") {
+    SECTION("Nominal calculation matches manual statistical derivation") {
+        std::vector<double> prices = {100.0, 102.0, 101.0, 104.0};
+
+        // 3 returns from 4 prices:
+        // r1 = ln(102/100) = 0.019802627
+        // r2 = ln(101/102) = -0.009852297
+        // r3 = ln(104/101) = 0.029270438
+        // Telescoping mean = ln(104/100)/3 = 0.013073590
+        // Sample standard deviation (ddof=1) = ~0.020410954
+        // Annualized vol (factor 252) = ~0.324013868
+        auto res = realized_volatility(prices, 3, 252.0);
+        REQUIRE(res.has_value());
+        CHECK_THAT(*res, WithinAbs(0.324013868, 1e-6));
+
+        // Daily unannualized volatility (factor 1.0)
+        auto res_daily = realized_volatility(prices, 3, 1.0);
+        REQUIRE(res_daily.has_value());
+        CHECK_THAT(*res_daily, WithinAbs(0.020410954, 1e-6));
+    }
+
+    SECTION("Constant prices yield zero volatility") {
+        std::vector<double> prices = {50.0, 50.0, 50.0, 50.0, 50.0};
+
+        auto res = realized_volatility(prices, 4);
+        REQUIRE(res.has_value());
+        CHECK_THAT(*res, WithinAbs(0.0, 1e-9));
+    }
+
+    SECTION("Trailing window ignores preceding history") {
+        // Preceding extreme prices should be excluded
+        std::vector<double> prices = {999.0, 5.0, 100.0, 102.0, 101.0, 104.0};
+
+        auto res = realized_volatility(prices, 3, 252.0);
+        REQUIRE(res.has_value());
+        CHECK_THAT(*res, WithinAbs(0.324013868, 1e-6));
+    }
+
+    SECTION("Zero-allocation with fixed-size stack arrays (std::array)") {
+        std::array<double, 4> stack_prices = {100.0, 102.0, 101.0, 104.0};
+
+        auto res = realized_volatility(stack_prices, 3, 252.0);
+        REQUIRE(res.has_value());
+        CHECK_THAT(*res, WithinAbs(0.324013868, 1e-6));
+    }
+}
+
+TEST_CASE("Realized Volatility edge cases and boundary defense", "[indicators]") {
+    SECTION("Period less than 2 returns std::nullopt") {
+        std::vector<double> prices = {100.0, 102.0, 101.0};
+
+        CHECK(!realized_volatility(prices, 0).has_value());
+        CHECK(!realized_volatility(prices, 1).has_value());
+    }
+
+    SECTION("Insufficient prices (less than period + 1) returns std::nullopt") {
+        std::vector<double> prices = {100.0, 102.0, 101.0};
+
+        // Period 3 requires 4 prices
+        CHECK(!realized_volatility(prices, 3).has_value());
+    }
+
+    SECTION("Empty price sequence returns std::nullopt") {
+        std::vector<double> empty_prices;
+
+        CHECK(!realized_volatility(empty_prices, 2).has_value());
+    }
+
+    SECTION("Non-positive prices return std::nullopt") {
+        std::vector<double> zero_price = {100.0, 0.0, 101.0, 104.0};
+        std::vector<double> neg_price = {100.0, -10.0, 101.0, 104.0};
+
+        CHECK(!realized_volatility(zero_price, 3).has_value());
+        CHECK(!realized_volatility(neg_price, 3).has_value());
+    }
+
+    SECTION("Non-positive annualization factor returns std::nullopt") {
+        std::vector<double> prices = {100.0, 102.0, 101.0, 104.0};
+
+        CHECK(!realized_volatility(prices, 3, 0.0).has_value());
+        CHECK(!realized_volatility(prices, 3, -252.0).has_value());
+    }
+}
