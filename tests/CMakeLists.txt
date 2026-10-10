@@ -6,6 +6,7 @@ add_executable(run_unit_tests
     test_token_manager.cpp
     test_config.cpp
     test_indicators.cpp
+    test_order.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 
