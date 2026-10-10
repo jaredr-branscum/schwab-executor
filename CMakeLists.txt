@@ -53,5 +53,14 @@ target_link_libraries(schwab_core PUBLIC
     nlohmann_json::nlohmann_json
 )
 
+# Main CLI executable
+add_executable(schwab_executor
+    src/main.cpp
+)
+
+target_link_libraries(schwab_executor PRIVATE
+    schwab_core
+)
+
 # Subdirectories
 add_subdirectory(tests)

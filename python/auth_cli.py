@@ -26,27 +26,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Ensure local common module is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import (
+    DEFAULT_BASE_URL,
+    DEFAULT_CALLBACK_URL,
+    DEFAULT_TOKEN_PATH,
+    load_env,
+    load_token as common_load_token,
+    save_token as common_save_token,
+)
+
 OAUTH_AUTHORIZE_PATH = "/v1/oauth/authorize"
 OAUTH_TOKEN_PATH = "/v1/oauth/token"
-DEFAULT_BASE_URL = "https://api.schwabapi.com"
-DEFAULT_CALLBACK_URL = "https://127.0.0.1"
-DEFAULT_TOKEN_PATH = ".schwab_token.json"
-
-
-def load_env(env_path: Path) -> dict:
-    """.env file parser"""
-    config = {}
-    if not env_path.exists():
-        return config
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                key, val = line.split("=", 1)
-                config[key.strip()] = val.strip().strip("'\"")
-    return config
 
 
 class SchwabAuth:
@@ -85,24 +77,10 @@ class SchwabAuth:
         return raw
 
     def load_token(self) -> dict:
-        if not self.token_path.exists():
-            return {}
-        try:
-            with open(self.token_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            print(f"[WARN] Token file '{self.token_path}' is corrupted JSON: {e}", file=sys.stderr)
-            return {}
-        except OSError as e:
-            print(f"[ERROR] Cannot access token file '{self.token_path}': {e}", file=sys.stderr)
-            return {}
+        return common_load_token(self.token_path)
 
     def save_token(self, token_data: dict) -> None:
-        self.token_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.token_path.with_suffix(".tmp")
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(token_data, f, indent=2)
-        temp_path.replace(self.token_path)
+        common_save_token(self.token_path, token_data)
 
     def is_authenticated(self) -> bool:
         token = self.load_token()
