@@ -46,6 +46,7 @@ add_library(schwab_core
     src/config.cpp
     src/indicators.cpp
     src/order.cpp
+    src/risk_guard.cpp
 )
 
 target_include_directories(schwab_core PUBLIC

@@ -7,6 +7,7 @@ add_executable(run_unit_tests
     test_config.cpp
     test_indicators.cpp
     test_order.cpp
+    test_risk_guard.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 
