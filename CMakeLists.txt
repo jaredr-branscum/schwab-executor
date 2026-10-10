@@ -43,6 +43,7 @@ add_library(schwab_core
     src/process_runner.cpp
     src/token.cpp
     src/token_manager.cpp
+    src/config.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
