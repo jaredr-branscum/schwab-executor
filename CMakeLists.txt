@@ -44,6 +44,7 @@ add_library(schwab_core
     src/token.cpp
     src/token_manager.cpp
     src/config.cpp
+    src/indicators.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
