@@ -14,12 +14,27 @@ schwab-executor/
 ├── .gitignore              # Ignores build artifacts, tokens, and logs
 ├── include/                # Public C++ header files (.hpp)
 │   └── schwab/
+│       ├── process_runner.hpp  # Subprocess execution & output capture
+│       ├── time.hpp            # Decoupled monotonic & wall clocks
+│       ├── token.hpp           # OAuthToken model & pre-computed auth header
+│       └── token_manager.hpp   # Session manager & JSON cache deserializer
 ├── src/                    # C++ implementation files (.cpp)
+│   ├── process_runner.cpp
+│   ├── time.cpp
+│   ├── token.cpp
+│   ├── token_manager.cpp
+│   └── main.cpp            # Main CLI engine entry point
 ├── tests/                  # Catch2 unit test suites
 │   ├── CMakeLists.txt
-│   └── test_sanity.cpp
+│   ├── test_sanity.cpp
+│   ├── test_process_runner.cpp
+│   ├── test_time.cpp
+│   ├── test_token.cpp
+│   └── test_token_manager.cpp
 └── python/                 # Self-contained Python helpers
-    └── auth_cli.py         # Standalone OAuth 2.0 authentication manager
+    ├── common.py           # Shared constants and atomic token/env I/O
+    ├── auth_cli.py         # Standalone OAuth 2.0 authentication manager
+    └── status_cli.py       # Live account balance & portfolio diagnostic query
 ```
 
 ---
@@ -109,7 +124,66 @@ python python/auth_cli.py --login
 
 ---
 
-## 3. Running C++ Unit Tests
+## 3. Running the C++ Execution Engine (`schwab_executor`)
+
+### Building the Executable
+Build the project using the one-click runner `run_tests.bat`, or compile directly via CMake:
+```powershell
+cmake -B build
+cmake --build build --config Debug
+```
+The compiled executable is generated at:
+* `build/Debug/schwab_executor.exe` (or `build\Debug\schwab_executor.exe` on Windows)
+
+### CLI Command Reference
+Run the engine from your terminal:
+
+```powershell
+# Display help and usage banner
+.\build\Debug\schwab_executor.exe --help
+
+# Inspect active OAuth session diagnostics and live Schwab account balances
+.\build\Debug\schwab_executor.exe --mode status
+
+# Verify session or trigger interactive browser login if expired
+.\build\Debug\schwab_executor.exe --mode auth
+
+# Specify a custom token cache path
+.\build\Debug\schwab_executor.exe --mode status --token-path .schwab_token.json
+```
+
+### CLI Modes & Options
+
+| Mode / Option | Description |
+| :--- | :--- |
+| `--mode status` | Inspects OAuth session TTLs, verifies pre-computed zero-allocation auth headers, and queries live Schwab Trader API account diagnostics (equity & cash). |
+| `--mode auth` | Verifies active session. If expired or missing, launches the interactive browser login flow to authenticate. |
+| `--token-path <path>` | Path to the local OAuth token JSON cache (defaults to `.schwab_token.json`). |
+| `--help`, `-h` | Displays the engine's usage banner and options. |
+
+### Example Diagnostic Output (`--mode status`)
+```text
+================================================================================
+  [SCHWAB-EXECUTOR] LIVE STATUS & DIAGNOSTICS
+================================================================================
+  * OAuth Session Status : [AUTHENTICATED]
+  * Access Token State   : [VALID]
+  * Access Token TTL     : 1800.0s remaining
+  * Refresh Token TTL    : 7.00 days remaining
+  * Pre-baked Auth Header: Bearer ey....xxxx
+
+  --- Charles Schwab Account Diagnostics ---
+  * Accounts Linked       : 2 Account(s)
+    - Account 1 [***1234 - MARGIN]: Liquidation Value = $1,234.00 | Cash = $1,234.00
+    - Account 2 [***5678 - MARGIN]: Liquidation Value = $6,767.00 | Cash = $67.00
+  * Total Portfolio Equity: $8,001.00
+  * Total Available Cash  : $1,301.00
+================================================================================
+```
+
+---
+
+## 4. Running C++ Unit Tests
 
 From the project root directory, run:
 ```cmd
