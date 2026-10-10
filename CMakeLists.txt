@@ -31,5 +31,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Catch2)
 
+# Core library target
+add_library(schwab_core
+    src/process_runner.cpp
+)
+
+target_include_directories(schwab_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 # Subdirectories
 add_subdirectory(tests)
