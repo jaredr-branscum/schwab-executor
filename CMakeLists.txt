@@ -34,6 +34,7 @@ FetchContent_MakeAvailable(Catch2)
 # Core library target
 add_library(schwab_core
     src/process_runner.cpp
+    src/token.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
