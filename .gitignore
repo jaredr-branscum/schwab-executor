@@ -1,0 +1,19 @@
+# Build directory
+build/
+bin/
+lib/
+out/
+
+# Visual Studio files
+.vs/
+*.vcxproj*
+*.sln
+
+# Secrets and tokens
+.env
+.schwab_token*.json
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
