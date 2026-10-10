@@ -8,9 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Modern compiler warning flags and multi-processor build flag
 if(MSVC)
-    add_compile_options(/W4 /permissive- /Zc:__cplusplus /utf-8 /MP)
+    add_compile_options(/W4 /permissive- /Zc:__cplusplus /utf-8 /MP /arch:AVX2)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    add_compile_options(-Wall -Wextra -Wpedantic -mavx2 -mfma)
 endif()
 
 # Include directories
