@@ -147,7 +147,12 @@ int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    std::string_view mode = "status";
+    if (argc <= 1) {
+        print_help();
+        return 0;
+    }
+
+    std::string_view mode = "";
     std::string_view token_path_str = ".schwab_token.json";
     std::string_view config_path_str = ".env";
     std::string_view account_hash_str = "";
@@ -175,6 +180,11 @@ int main(int argc, char* argv[]) {
         } else if (arg == "auth" || arg == "status" || arg == "execute") {
             mode = arg;
         }
+    }
+
+    if (mode.empty() || mode == "help") {
+        print_help();
+        return (mode == "help") ? 0 : 1;
     }
 
     std::filesystem::path token_path(token_path_str);
