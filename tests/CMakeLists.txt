@@ -11,6 +11,7 @@ add_executable(run_unit_tests
     test_http_types.cpp
     test_http_client.cpp
     test_order_serializer.cpp
+    test_rebalancer.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 

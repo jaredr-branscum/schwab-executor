@@ -69,6 +69,14 @@ struct FixedString {
     [[nodiscard]] constexpr bool operator==(std::string_view other) const noexcept {
         return view() == other;
     }
+
+    [[nodiscard]] constexpr bool operator==(const FixedString& other) const noexcept {
+        return view() == other.view();
+    }
+
+    [[nodiscard]] constexpr bool operator==(const char* str) const noexcept {
+        return view() == (str ? std::string_view(str) : std::string_view{});
+    }
     [[nodiscard]] constexpr bool is_valid() const noexcept {
         if (empty()) {
             return false;

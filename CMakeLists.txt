@@ -50,6 +50,7 @@ add_library(schwab_core
     src/http_types.cpp
     src/http_client.cpp
     src/order_serializer.cpp
+    src/rebalancer.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
