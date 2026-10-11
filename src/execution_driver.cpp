@@ -165,13 +165,32 @@ ExecutionReport ExecutionDriver::execute_plan(
 
     report.results.reserve(plan.orders.size());
 
+    bool has_sell_failed = false;
+
     for (const auto& order : plan.orders) {
+        if (order.side == OrderSide::Buy && config_.abort_buys_on_sell_failure && has_sell_failed) [[unlikely]] {
+            OrderExecutionResult res;
+            res.order = order;
+            res.order.status = OrderStatus::Rejected;
+            res.success = false;
+            res.http_status = 0;
+            res.error_message = "Buy order aborted: preceding sell order submission failed at broker (atomic abort)";
+            ++report.total_failed;
+            ++report.total_submitted;
+            report.all_succeeded = false;
+            report.results.push_back(std::move(res));
+            continue;
+        }
+
         OrderExecutionResult res = execute_single_order(order, access_token);
         if (res.success) {
             ++report.total_succeeded;
         } else {
             ++report.total_failed;
             report.all_succeeded = false;
+            if (order.side == OrderSide::Sell) {
+                has_sell_failed = true;
+            }
         }
         ++report.total_submitted;
         const int status = res.http_status;

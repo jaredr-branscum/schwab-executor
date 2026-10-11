@@ -1,5 +1,6 @@
 #pragma once
 
+#include "schwab/market_data.hpp"
 #include "schwab/order.hpp"
 #include "schwab/risk_guard.hpp"
 
@@ -41,8 +42,9 @@ struct RebalancerOptions {
     OrderType order_type = OrderType::Market;
     TimeInForce duration = TimeInForce::Day;
     OrderSession session = OrderSession::Normal;
-    double min_share_threshold = 0.0001; // Ignore deltas smaller than this
-    bool liquidate_untracked = true;     // Liquidate positions not present in target allocations
+    double min_share_threshold = 0.0001;      // Ignore deltas smaller than this
+    bool liquidate_untracked = true;          // Liquidate positions not present in target allocations
+    bool abort_buys_on_sell_rejection = true; // Atomic abort: cancel all buys if any sell is blocked/rejected
 };
 
 /**
@@ -81,6 +83,32 @@ public:
     [[nodiscard]] static RebalancePlan generate_plan(
         std::span<const TargetAllocation> targets,
         std::span<const Position> current_positions,
+        const RiskGuard* risk_guard = nullptr,
+        const RebalancerOptions& options = {}
+    );
+
+    /**
+     * @brief Generates execution plan from target allocations, current positions, and live quotes.
+     *
+     * Enforces following sequencing:
+     * 1. Untracked Liquidations (100% full exits to maximize released capital)
+     * 2. Target Trims (Partial position reductions)
+     * 3. Target Buys (Staged after cash is unlocked)
+     *
+     * Orders are evaluated against real-time Quote data (spread circuit breakers,
+     * crossed-book gates, and spread-aware collars) if quotes are provided.
+     *
+     * @param targets Target allocations for portfolio.
+     * @param current_positions Current account positions.
+     * @param quotes Real-time quotes for symbols being traded.
+     * @param risk_guard Optional pre-trade risk gate.
+     * @param options Execution configuration options.
+     * @return Generated RebalancePlan.
+     */
+    [[nodiscard]] static RebalancePlan generate_plan(
+        std::span<const TargetAllocation> targets,
+        std::span<const Position> current_positions,
+        std::span<const Quote> quotes,
         const RiskGuard* risk_guard = nullptr,
         const RebalancerOptions& options = {}
     );

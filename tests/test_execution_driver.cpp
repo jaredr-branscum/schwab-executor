@@ -322,3 +322,48 @@ TEST_CASE("ExecutionDriver batch pre-flight validation", "[execution_driver]") {
     }
 }
 
+TEST_CASE("ExecutionDriver runtime atomic abort on sell failure", "[execution_driver]") {
+    auto mock = std::make_unique<MockTransport>();
+    MockTransport* raw_mock = mock.get();
+
+    // Sell order fails with 500 internal server error from broker
+    raw_mock->handler = [](const HttpRequest& req) {
+        HttpResponse r;
+        if (req.body.find("\"instruction\":\"SELL\"") != std::string_view::npos) {
+            r.status_code = 500;
+            r.body = "{\"error\":\"broker_error\",\"message\":\"Exchange connection dropped\"}";
+        } else {
+            r.status_code = 201;
+            r.headers.push_back({"Location", "/trader/v1/accounts/MOCK/orders/123"});
+        }
+        return r;
+    };
+
+    HttpClient client(std::move(mock));
+    ExecutionDriver driver(client, ExecutionDriverConfig{
+        .account_hash = "TEST_HASH",
+        .dry_run = false,
+        .abort_buys_on_sell_failure = true
+    });
+
+    RebalancePlan plan;
+    Order s1; s1.symbol = Symbol{"AAPL"}; s1.side = OrderSide::Sell; s1.quantity = 10.0;
+    Order b1; b1.symbol = Symbol{"MSFT"}; b1.side = OrderSide::Buy; b1.quantity = 20.0;
+    plan.orders = {s1, b1};
+
+    ExecutionReport report = driver.execute_plan(plan, "valid_token");
+
+    // S1 was sent over network and failed
+    REQUIRE(raw_mock->send_count == 1);
+    REQUIRE(report.total_submitted == 2);
+    REQUIRE(report.total_failed == 2);
+    REQUIRE_FALSE(report.all_succeeded);
+
+    // B1 was aborted without network dispatch under atomic abort policy!
+    REQUIRE(report.results.size() == 2);
+    CHECK(report.results[0].http_status == 500);
+    CHECK(report.results[1].http_status == 0);
+    CHECK(report.results[1].error_message.find("atomic abort") != std::string::npos);
+}
+
+

@@ -170,7 +170,7 @@ This architecture ensures proprietary intellectual property remains 100% confide
 Multiple distinct models can be composed into a unified portfolio using [`CompositeStrategy`](../include/schwab/strategy.hpp). Orders emitted by each sub-model are automatically attributed with distinct strategy tags in execution telemetry:
 
 ```cpp
-auto composite = std::make_shared<schwab::CompositeStrategy>("InstitutionalPortfolio");
+auto composite = std::make_shared<schwab::CompositeStrategy>("CompositePortfolio");
 composite->add_strategy(std::make_shared<RebalanceModelA>());
 composite->add_strategy(std::make_shared<MomentumModelB>());
 
