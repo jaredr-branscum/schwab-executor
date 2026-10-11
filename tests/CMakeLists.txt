@@ -9,6 +9,7 @@ add_executable(run_unit_tests
     test_order.cpp
     test_risk_guard.cpp
     test_http_types.cpp
+    test_http_client.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 

@@ -48,6 +48,7 @@ add_library(schwab_core
     src/order.cpp
     src/risk_guard.cpp
     src/http_types.cpp
+    src/http_client.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
@@ -57,6 +58,10 @@ target_include_directories(schwab_core PUBLIC
 target_link_libraries(schwab_core PUBLIC
     nlohmann_json::nlohmann_json
 )
+
+if(WIN32)
+    target_link_libraries(schwab_core PUBLIC winhttp)
+endif()
 
 # Main CLI executable
 add_executable(schwab_executor
