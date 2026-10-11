@@ -51,6 +51,7 @@ add_library(schwab_core
     src/http_client.cpp
     src/order_serializer.cpp
     src/rebalancer.cpp
+    src/execution_driver.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
