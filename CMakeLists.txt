@@ -57,6 +57,7 @@ add_library(schwab_core
     src/account_manager.cpp
     src/market_data.cpp
     src/execution_runner.cpp
+    src/order_detail.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
