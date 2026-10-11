@@ -49,6 +49,7 @@ add_library(schwab_core
     src/risk_guard.cpp
     src/http_types.cpp
     src/http_client.cpp
+    src/order_serializer.cpp
 )
 
 target_include_directories(schwab_core PUBLIC

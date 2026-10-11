@@ -170,6 +170,12 @@ public:
         }
     }
 
+    enum class RequestResult {
+        Success,
+        PreSendFailure,   // Failed before wire transmission (safe to retry for all methods)
+        PostSendFailure   // Failed after wire transmission (retry only for idempotent methods)
+    };
+
     [[nodiscard]] HttpResponse send(const HttpRequest& request) override {
         auto start_time = std::chrono::steady_clock::now();
 
@@ -186,14 +192,23 @@ public:
         }
 
         HttpResponse response;
-        bool success = execute_request(request, response, start_time);
+        RequestResult result = execute_request(request, response, start_time);
 
         // Idle drop / server reset resilience:
-        // If request failed due to closed keep-alive socket, immediately reconnect and retry once
-        if (!success && config_.max_retries_on_idle_drop > 0) {
-            disconnect();
-            if (prewarm()) {
-                execute_request(request, response, start_time);
+        // PreSendFailure: Socket was dead before transmission; safe to reconnect and retry for ANY request.
+        // PostSendFailure: Socket dropped after transmission; retry ONLY if request is idempotent
+        // (GET, HEAD, OPTIONS) to avoid duplicate order execution
+        const bool is_idempotent = (request.method == HttpMethod::Get ||
+                                    request.method == HttpMethod::Head ||
+                                    request.method == HttpMethod::Options);
+
+        if (result != RequestResult::Success && config_.max_retries_on_idle_drop > 0) {
+            const bool safe_to_retry = (result == RequestResult::PreSendFailure) || is_idempotent;
+            if (safe_to_retry) {
+                disconnect();
+                if (prewarm()) {
+                    execute_request(request, response, start_time);
+                }
             }
         }
 
@@ -205,8 +220,8 @@ public:
     }
 
 private:
-    bool execute_request(const HttpRequest& request, HttpResponse& response,
-                         std::chrono::steady_clock::time_point start_time) {
+    RequestResult execute_request(const HttpRequest& request, HttpResponse& response,
+                                  std::chrono::steady_clock::time_point start_time) {
         // Zero allocation: clear scratch buffers while preserving pre-reserved capacity
         method_buf_.clear();
         to_wide_buffer(to_string_view(request.method), method_buf_);
@@ -230,7 +245,7 @@ private:
             response.body = "{\"error\":\"Failed to open HTTP request\"}";
             auto end_time = std::chrono::steady_clock::now();
             response.latency = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            return false;
+            return RequestResult::PreSendFailure;
         }
 
         // Build wide headers string in pre-reserved scratch buffer
@@ -288,7 +303,7 @@ private:
             response.body = "{\"error\":\"WinHttpSendRequest failed\"}";
             auto end_time = std::chrono::steady_clock::now();
             response.latency = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            return false;
+            return RequestResult::PreSendFailure;
         }
 
         BOOL rec_ok = ::WinHttpReceiveResponse(req_handle.handle, nullptr);
@@ -297,7 +312,7 @@ private:
             response.body = "{\"error\":\"WinHttpReceiveResponse failed\"}";
             auto end_time = std::chrono::steady_clock::now();
             response.latency = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            return false;
+            return RequestResult::PostSendFailure;
         }
 
         // Query status code
@@ -313,9 +328,70 @@ private:
         );
         response.status_code = static_cast<int>(status_code);
 
+        // Query raw response headers
+        DWORD headers_bytes = 0;
+        ::WinHttpQueryHeaders(
+            req_handle.handle,
+            WINHTTP_QUERY_RAW_HEADERS_CRLF,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            WINHTTP_NO_OUTPUT_BUFFER,
+            &headers_bytes,
+            WINHTTP_NO_HEADER_INDEX
+        );
+
+        if (::GetLastError() == ERROR_INSUFFICIENT_BUFFER && headers_bytes > 0) {
+            headers_buf_.resize(headers_bytes / sizeof(wchar_t));
+            if (::WinHttpQueryHeaders(
+                    req_handle.handle,
+                    WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                    WINHTTP_HEADER_NAME_BY_INDEX,
+                    headers_buf_.data(),
+                    &headers_bytes,
+                    WINHTTP_NO_HEADER_INDEX)) {
+                size_t pos = 0;
+                size_t first_crlf = headers_buf_.find(L"\r\n");
+                if (first_crlf != std::wstring::npos) {
+                    pos = first_crlf + 2; // Skip status line
+                }
+                response.headers.clear();
+                response.headers.reserve(16);
+                while (pos < headers_buf_.size()) {
+                    size_t next_crlf = headers_buf_.find(L"\r\n", pos);
+                    if (next_crlf == std::wstring::npos || next_crlf == pos) {
+                        break;
+                    }
+                    std::wstring_view line{headers_buf_.data() + pos, next_crlf - pos};
+                    size_t colon = line.find(L':');
+                    if (colon != std::wstring_view::npos) {
+                        std::wstring_view h_name = line.substr(0, colon);
+                        std::wstring_view h_val = line.substr(colon + 1);
+                        while (!h_val.empty() && (h_val.front() == L' ' || h_val.front() == L'\t')) {
+                            h_val.remove_prefix(1);
+                        }
+                        if (!h_name.empty()) {
+                            response.headers.push_back(HttpHeader{
+                                to_utf8(h_name.data(), h_name.size()),
+                                to_utf8(h_val.data(), h_val.size())
+                            });
+                        }
+                    }
+                    pos = next_crlf + 2;
+                }
+            }
+        }
+
         // Pre-reserve body memory for zero-reallocation JSON absorption
         response.body.clear();
-        response.body.reserve(2048);
+        auto cl_hdr = response.find_header("Content-Length");
+        size_t est_body = 2048;
+        if (cl_hdr.has_value()) {
+            size_t cl_val = 0;
+            auto [cl_p, cl_ec] = std::from_chars(cl_hdr->data(), cl_hdr->data() + cl_hdr->size(), cl_val);
+            if (cl_ec == std::errc() && cl_val > 0) {
+                est_body = cl_val;
+            }
+        }
+        response.body.reserve(est_body);
 
         // Zero heap allocations in read loop: read directly into 8 KB stack buffer
         DWORD bytes_avail = 0;
@@ -331,7 +407,7 @@ private:
 
         auto end_time = std::chrono::steady_clock::now();
         response.latency = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        return true;
+        return RequestResult::Success;
     }
 
     bool init_session() {

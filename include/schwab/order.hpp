@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cmath>
 #include <string_view>
 #include <optional>
 #include <cstdint>
@@ -68,6 +69,18 @@ struct FixedString {
     [[nodiscard]] constexpr bool operator==(std::string_view other) const noexcept {
         return view() == other;
     }
+    [[nodiscard]] constexpr bool is_valid() const noexcept {
+        if (empty()) {
+            return false;
+        }
+        for (char c : view()) {
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '-' || c == '/')) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
 using Symbol = FixedString<16>;
@@ -89,6 +102,14 @@ enum class OrderType : uint8_t {
 enum class TimeInForce : uint8_t {
     Day,
     Gtc
+};
+
+/// @brief Trading session eligibility
+enum class OrderSession : uint8_t {
+    Normal,     // Regular market hours (9:30 AM - 4:00 PM ET)
+    Am,         // Pre-market (7:00 AM - 9:28 AM ET)
+    Pm,         // After-hours (4:02 PM - 8:00 PM ET)
+    Seamless    // Extended + Regular hours
 };
 
 /// @brief Lifecycle state of an order
@@ -126,6 +147,16 @@ enum class OrderStatus : uint8_t {
     return "UNKNOWN";
 }
 
+[[nodiscard]] constexpr std::string_view to_string(OrderSession session) noexcept {
+    switch (session) {
+        case OrderSession::Normal:   return "NORMAL";
+        case OrderSession::Am:       return "AM";
+        case OrderSession::Pm:       return "PM";
+        case OrderSession::Seamless: return "SEAMLESS";
+    }
+    return "NORMAL";
+}
+
 [[nodiscard]] constexpr std::string_view to_string(OrderStatus status) noexcept {
     switch (status) {
         case OrderStatus::New: return "NEW";
@@ -140,6 +171,7 @@ enum class OrderStatus : uint8_t {
 [[nodiscard]] std::optional<OrderSide> order_side_from_string(std::string_view str) noexcept;
 [[nodiscard]] std::optional<OrderType> order_type_from_string(std::string_view str) noexcept;
 [[nodiscard]] std::optional<TimeInForce> time_in_force_from_string(std::string_view str) noexcept;
+[[nodiscard]] std::optional<OrderSession> order_session_from_string(std::string_view str) noexcept;
 
 /// @brief Execution order specification
 /// Struct contents should fit within single 64-byte L1 CPU cache line
@@ -151,17 +183,31 @@ struct Order {
     OrderType type{OrderType::Market};
     TimeInForce duration{TimeInForce::Day};
     OrderStatus status{OrderStatus::New};
+    OrderSession session{OrderSession::Normal};
 
-    // Stack symbol buffer (12 bytes, fits any US equity ticker with zero heap allocation)
+    // Stack symbol buffer (16 bytes, fits any US equity ticker with zero heap allocation)
     Symbol symbol{};
 
     /// @brief Validates structural sanity of the order (inlined on hot path)
     [[nodiscard]] inline bool is_valid() const noexcept {
-        if (symbol.empty() || quantity <= 0.0) {
+        if (!symbol.is_valid() || !std::isfinite(quantity) || quantity <= 0.0) [[unlikely]] {
+            return false;
+        }
+        if (side != OrderSide::Buy && side != OrderSide::Sell) [[unlikely]] {
+            return false;
+        }
+        if (type != OrderType::Market && type != OrderType::Limit && type != OrderType::MarketOnClose) [[unlikely]] {
+            return false;
+        }
+        if (duration != TimeInForce::Day && duration != TimeInForce::Gtc) [[unlikely]] {
+            return false;
+        }
+        if (session != OrderSession::Normal && session != OrderSession::Am &&
+            session != OrderSession::Pm && session != OrderSession::Seamless) [[unlikely]] {
             return false;
         }
         if (type == OrderType::Limit) {
-            return limit_price.has_value() && *limit_price > 0.0;
+            return limit_price.has_value() && std::isfinite(*limit_price) && *limit_price > 0.0;
         }
         return true;
     }

@@ -61,6 +61,23 @@ TEST_CASE("Order enum conversions and string parsing", "[order]") {
         CHECK(to_string(OrderStatus::Cancelled) == "CANCELLED");
         CHECK(to_string(OrderStatus::Rejected) == "REJECTED");
     }
+
+    SECTION("OrderSession string conversions and parsing") {
+        CHECK(to_string(OrderSession::Normal) == "NORMAL");
+        CHECK(to_string(OrderSession::Am) == "AM");
+        CHECK(to_string(OrderSession::Pm) == "PM");
+        CHECK(to_string(OrderSession::Seamless) == "SEAMLESS");
+
+        CHECK(order_session_from_string("NORMAL") == OrderSession::Normal);
+        CHECK(order_session_from_string("normal") == OrderSession::Normal);
+        CHECK(order_session_from_string("AM") == OrderSession::Am);
+        CHECK(order_session_from_string("am") == OrderSession::Am);
+        CHECK(order_session_from_string("PM") == OrderSession::Pm);
+        CHECK(order_session_from_string("pm") == OrderSession::Pm);
+        CHECK(order_session_from_string("SEAMLESS") == OrderSession::Seamless);
+        CHECK(order_session_from_string("seamless") == OrderSession::Seamless);
+        CHECK(!order_session_from_string("UNKNOWN").has_value());
+    }
 }
 
 TEST_CASE("Order validation rules", "[order]") {

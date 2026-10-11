@@ -55,4 +55,20 @@ std::optional<TimeInForce> time_in_force_from_string(std::string_view str) noexc
     return std::nullopt;
 }
 
+std::optional<OrderSession> order_session_from_string(std::string_view str) noexcept {
+    if (iequals(str, "NORMAL")) {
+        return OrderSession::Normal;
+    }
+    if (iequals(str, "AM")) {
+        return OrderSession::Am;
+    }
+    if (iequals(str, "PM")) {
+        return OrderSession::Pm;
+    }
+    if (iequals(str, "SEAMLESS")) {
+        return OrderSession::Seamless;
+    }
+    return std::nullopt;
+}
+
 } // namespace schwab
