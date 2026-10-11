@@ -18,6 +18,7 @@ TEST_CASE("RiskRejectReason string representation", "[risk_guard]") {
     CHECK(to_string(RiskRejectReason::ExceedsMaxOrderQuantity) == "EXCEEDS_MAX_ORDER_QUANTITY");
     CHECK(to_string(RiskRejectReason::ExceedsMaxPositionNotional) == "EXCEEDS_MAX_POSITION_NOTIONAL");
     CHECK(to_string(RiskRejectReason::PriceCollarViolation) == "PRICE_COLLAR_VIOLATION");
+    CHECK(to_string(RiskRejectReason::MocCutoffExceeded) == "MOC_CUTOFF_EXCEEDED");
     CHECK(to_string(RiskRejectReason::DryRunIntercepted) == "DRY_RUN_INTERCEPTED");
 }
 
@@ -210,3 +211,63 @@ TEST_CASE("RiskGuard pre-trade rejection gates", "[risk_guard]") {
         CHECK(res.reason == RiskRejectReason::DryRunIntercepted);
     }
 }
+
+TEST_CASE("RiskGuard Market-on-Close (MOC) cutoff gate", "[risk_guard]") {
+    RiskLimits limits{
+        .max_order_notional = 100'000.0,
+        .max_order_quantity = 5'000.0,
+        .max_position_notional = 250'000.0,
+        .price_collar_percent = 0.05,
+        .moc_cutoff_seconds_utc = 75'000, // 20:50:00 UTC (15:50 EST)
+        .enforce_moc_cutoff = true,
+        .dry_run = false
+    };
+
+    RiskGuard guard(limits);
+
+    Order moc_ord{
+        .quantity = 50.0,
+        .side = OrderSide::Buy,
+        .type = OrderType::MarketOnClose,
+        .symbol = "SPY"
+    };
+
+    SECTION("Approval: MOC order submitted before cutoff (e.g. 15:45 EST / 74,700s UTC)") {
+        constexpr uint32_t t_before_cutoff = 74'700;
+        auto res = guard.validate_order(moc_ord, 0.0, 500.0, t_before_cutoff);
+        REQUIRE(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
+
+    SECTION("Rejection: MOC order submitted after cutoff (e.g. 15:52 EST / 75,120s UTC)") {
+        constexpr uint32_t t_after_cutoff = 75'120;
+        auto res = guard.validate_order(moc_ord, 0.0, 500.0, t_after_cutoff);
+        REQUIRE_FALSE(res.approved);
+        CHECK(res.reason == RiskRejectReason::MocCutoffExceeded);
+        CHECK(res.message.find("cutoff") != std::string_view::npos);
+    }
+
+    SECTION("Continuous Market order passes even after MOC cutoff") {
+        Order mkt_ord{
+            .quantity = 50.0,
+            .side = OrderSide::Buy,
+            .type = OrderType::Market,
+            .symbol = "SPY"
+        };
+        constexpr uint32_t t_late_bell = 75'585; // 15:59:45 EST
+        auto res = guard.validate_order(mkt_ord, 0.0, 500.0, t_late_bell);
+        REQUIRE(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
+
+    SECTION("Enforcement disabled allows MOC after cutoff") {
+        limits.enforce_moc_cutoff = false;
+        guard.set_limits(limits);
+
+        constexpr uint32_t t_after_cutoff = 75'120;
+        auto res = guard.validate_order(moc_ord, 0.0, 500.0, t_after_cutoff);
+        REQUIRE(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
+}
+

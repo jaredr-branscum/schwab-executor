@@ -1,6 +1,7 @@
 #pragma once
 
 #include "schwab/order.hpp"
+#include <chrono>
 #include <string_view>
 #include <cstdint>
 #include <cmath>
@@ -15,6 +16,7 @@ enum class RiskRejectReason : uint8_t {
     ExceedsMaxOrderQuantity,
     ExceedsMaxPositionNotional,
     PriceCollarViolation,
+    MocCutoffExceeded,
     DryRunIntercepted
 };
 
@@ -27,6 +29,7 @@ enum class RiskRejectReason : uint8_t {
         case RiskRejectReason::ExceedsMaxOrderQuantity: return "EXCEEDS_MAX_ORDER_QUANTITY";
         case RiskRejectReason::ExceedsMaxPositionNotional: return "EXCEEDS_MAX_POSITION_NOTIONAL";
         case RiskRejectReason::PriceCollarViolation: return "PRICE_COLLAR_VIOLATION";
+        case RiskRejectReason::MocCutoffExceeded: return "MOC_CUTOFF_EXCEEDED";
         case RiskRejectReason::DryRunIntercepted: return "DRY_RUN_INTERCEPTED";
     }
     return "UNKNOWN";
@@ -51,7 +54,9 @@ struct RiskLimits {
     double max_order_quantity{10'000.0};        // Max share count per single order (offset 8..15)
     double max_position_notional{500'000.0};    // Max $ position exposure per symbol (offset 16..23)
     double price_collar_percent{0.05};          // Max allowed price deviation (5%) (offset 24..31)
-    bool dry_run{false};                        // Intercept orders when dry-run is active (offset 32)
+    uint32_t moc_cutoff_seconds_utc{75'000};    // Cutoff in seconds since UTC midnight (75,000s = 20:50:00 UTC / 15:50 EST) (offset 32..35)
+    bool enforce_moc_cutoff{true};              // Enforce exchange MOC cutoff deadline (offset 36)
+    bool dry_run{false};                        // Intercept orders when dry-run is active (offset 37)
 };
 static_assert(sizeof(RiskLimits) <= 64, "RiskLimits must fit within a single 64-byte CPU cache line");
 
@@ -64,11 +69,13 @@ public:
     /// @param order The order to validate
     /// @param current_position_quantity Existing shares held in this symbol (default 0.0)
     /// @param market_price Latest reference market price (used for Market/MOC orders and collars)
+    /// @param current_time_seconds_utc Current time in seconds since midnight UTC (0 for auto now())
     /// @return RiskCheckResult indicating approval or rejection reason
     [[nodiscard]] inline RiskCheckResult validate_order(
         const Order& order,
         double current_position_quantity = 0.0,
-        double market_price = 0.0) const noexcept {
+        double market_price = 0.0,
+        uint32_t current_time_seconds_utc = 0) const noexcept {
 
         if (!order.is_valid()) [[unlikely]] {
             return RiskCheckResult{
@@ -76,6 +83,23 @@ public:
                 .reason = RiskRejectReason::InvalidOrderStructure,
                 .message = "Order fails basic structural validity (empty symbol, non-positive quantity, or missing limit price)"
             };
+        }
+
+        // Market-On-Close (MOC) Regulatory Cutoff Gate
+        if (order.type == OrderType::MarketOnClose && limits_.enforce_moc_cutoff) [[unlikely]] {
+            uint32_t sec_utc = current_time_seconds_utc;
+            if (sec_utc == 0) {
+                auto now = std::chrono::system_clock::now();
+                auto dp = std::chrono::floor<std::chrono::days>(now);
+                sec_utc = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(now - dp).count());
+            }
+            if (sec_utc > limits_.moc_cutoff_seconds_utc) [[unlikely]] {
+                return RiskCheckResult{
+                    .approved = false,
+                    .reason = RiskRejectReason::MocCutoffExceeded,
+                    .message = "Market-on-close order rejected: submitted after exchange MOC cutoff deadline (20:50 UTC / 15:50 EST)"
+                };
+            }
         }
 
         // Reference Price Resolution
