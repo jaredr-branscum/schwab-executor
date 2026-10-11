@@ -19,6 +19,7 @@ add_executable(run_unit_tests
     test_market_data.cpp
     test_execution_runner.cpp
     test_order_detail.cpp
+    test_order_tracker.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 
