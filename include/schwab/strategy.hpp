@@ -79,6 +79,11 @@ public:
         return order_type_;
     }
 
+    /**
+     * @brief Parses target allocations from a formatted string (e.g. "SPY:0.60,QQQ:0.40")
+     */
+    [[nodiscard]] static std::vector<StrategyTargetWeight> parse_targets(std::string_view targets_str);
+
 private:
     std::vector<StrategyTargetWeight> targets_;
     OrderType order_type_{OrderType::Market};

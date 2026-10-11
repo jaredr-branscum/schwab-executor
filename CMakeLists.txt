@@ -55,7 +55,7 @@ add_library(schwab_core
     src/clock.cpp
     src/strategy.cpp
     src/account_manager.cpp
-    src/daemon.cpp
+    src/execution_runner.cpp
 )
 
 target_include_directories(schwab_core PUBLIC

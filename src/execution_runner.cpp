@@ -1,28 +1,16 @@
-#include "schwab/daemon.hpp"
+#include "schwab/execution_runner.hpp"
 #include "schwab/order_serializer.hpp"
 
 #include <algorithm>
 #include <chrono>
-#include <csignal>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
-#include <thread>
 
 namespace schwab {
 
-namespace {
-
-std::atomic<bool> g_daemon_stop_requested{false};
-
-void default_sigint_handler(int) {
-    g_daemon_stop_requested.store(true);
-}
-
-} // namespace
-
-DaemonRunner::DaemonRunner(DaemonConfig config, std::shared_ptr<IStrategy> strategy) noexcept
+ExecutionRunner::ExecutionRunner(ExecutionConfig config, std::shared_ptr<IStrategy> strategy) noexcept
     : config_(std::move(config)), strategy_(std::move(strategy)) {
     if (!strategy_) {
         // Default to a public reference sample strategy if none provided
@@ -33,7 +21,7 @@ DaemonRunner::DaemonRunner(DaemonConfig config, std::shared_ptr<IStrategy> strat
     }
 }
 
-std::string DaemonRunner::format_telemetry_table(
+std::string ExecutionRunner::format_telemetry_table(
     const ExecutionReport& report,
     bool is_dry_run
 ) {
@@ -87,7 +75,7 @@ std::string DaemonRunner::format_telemetry_table(
     return ss.str();
 }
 
-int DaemonRunner::run_immediate(
+int ExecutionRunner::execute(
     std::span<const Position> simulated_positions,
     std::optional<double> simulated_cash
 ) {
@@ -120,8 +108,8 @@ int DaemonRunner::run_immediate(
     }
 
     if (account_hash.empty() && !config_.dry_run) {
-        std::cerr << "  * Error: SCHWAB_TARGET_ACCOUNT_NUMBER is required for live execution.\n"
-                  << "    Set SCHWAB_TARGET_ACCOUNT_NUMBER in .env or provide --account-hash <hash>.\n\n";
+        std::cerr << "  * Error: Target account hash is required for live execution.\n"
+                  << "    Set SCHWAB_ACCOUNT_NUMBER in .env or provide --account-hash <hash>.\n\n";
         return 1;
     }
 
@@ -207,6 +195,7 @@ int DaemonRunner::run_immediate(
     std::vector<Order> approved_orders;
     approved_orders.reserve(raw_orders.size());
 
+    //TODO: must quote all symbols before approving orders
     for (const auto& ord : raw_orders) {
         double current_qty = 0.0;
         double market_price = 100.0; // fallback if unquoted
@@ -261,7 +250,7 @@ int DaemonRunner::run_immediate(
         telemetry_callback_(report);
     }
 
-    if (config_.telemetry_log_path.has_value()) {
+    if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
         std::error_code ec;
         if (config_.telemetry_log_path->has_parent_path()) {
             std::filesystem::create_directories(config_.telemetry_log_path->parent_path(), ec);
@@ -282,179 +271,6 @@ int DaemonRunner::run_immediate(
     }
 
     return report.all_succeeded ? 0 : 1;
-}
-
-int DaemonRunner::run_daemon(
-    std::atomic<bool>* stop_signal,
-    std::optional<size_t> max_cycles
-) {
-    std::atomic<bool>* active_stop = stop_signal;
-    if (!active_stop) {
-        g_daemon_stop_requested.store(false);
-        std::signal(SIGINT, default_sigint_handler);
-        active_stop = &g_daemon_stop_requested;
-    }
-
-    if (active_stop->load(std::memory_order_relaxed)) {
-        return 0;
-    }
-
-    if (config_.scheduled_times.empty() && !config_.intraday_interval.has_value()) {
-        Config cfg = Config::load_from_file(config_.config_path);
-        if (cfg.has_param("SCHWAB_INTRADAY_INTERVAL_MS")) {
-            auto interval_ms = cfg.get_int("SCHWAB_INTRADAY_INTERVAL_MS", 0);
-            if (interval_ms > 0) {
-                config_.intraday_interval = std::chrono::milliseconds(interval_ms);
-            }
-        }
-    }
-
-    if (config_.scheduled_times.empty() && !config_.intraday_interval.has_value()) {
-        std::cerr << "  * [ERROR] Neither scheduled bell times nor intraday_interval configured. Stopping daemon.\n";
-        return 1;
-    }
-
-    std::cout << "\n================================================================================\n"
-              << "  [SCHWAB-EXECUTOR] PERSISTENT TRADING DAEMON\n"
-              << "================================================================================\n"
-              << "  * Strategy Model     : [" << strategy_->name() << "]\n"
-              << "  * Execution Target   : " << (config_.dry_run ? "[SIMULATION - DRY RUN]" : "[LIVE BROKER ORDERS]") << "\n"
-              << "  * Scheduled Bells    : " << config_.scheduled_times.size() << " target times registered\n";
-
-    for (const auto& t : config_.scheduled_times) {
-        std::cout << "                         - " << t << " UTC\n";
-    }
-
-    if (config_.intraday_interval.has_value()) {
-        std::cout << "  * Intraday Interval  : " << config_.intraday_interval->count() << " ms (Continuous Loop Active)\n";
-    } else {
-        std::cout << "  * Intraday Interval  : [DISABLED] Pure Timed Bell Execution Mode\n";
-    }
-
-    std::cout << "  * Daemon Status      : [RUNNING] Press Ctrl+C to gracefully stop.\n"
-              << "================================================================================\n\n";
-
-    auto last_token_refresh = PrecisionClock::now();
-    size_t cycles_completed = 0;
-
-    while (!active_stop->load(std::memory_order_relaxed)) {
-        if (max_cycles.has_value() && cycles_completed >= *max_cycles) {
-            break;
-        }
-
-        // OAuth token auto-refresh maintenance
-        auto now_mono = PrecisionClock::now();
-        if (now_mono - last_token_refresh >= config_.token_refresh_interval) {
-            if (!config_.dry_run) {
-                std::cout << "  * [DAEMON HEARTBEAT] Auto-refreshing OAuth access token...\n";
-                TokenManager::ensure_authenticated(config_.token_path);
-            }
-            last_token_refresh = now_mono;
-        }
-
-        // Identify next scheduled market bell target
-        auto now_sys = PrecisionClock::system_now();
-        std::optional<std::chrono::system_clock::time_point> next_bell_tp;
-        std::string next_bell_str;
-
-        for (const auto& t_str : config_.scheduled_times) {
-            auto secs_opt = PrecisionClock::parse_time_of_day(t_str);
-            if (!secs_opt.has_value()) {
-                continue;
-            }
-            auto tp = PrecisionClock::next_occurrence_utc(*secs_opt, now_sys);
-            if (!next_bell_tp.has_value() || tp < *next_bell_tp) {
-                next_bell_tp = tp;
-                next_bell_str = t_str;
-            }
-        }
-
-        if (!config_.scheduled_times.empty() && !next_bell_tp.has_value() && !config_.intraday_interval.has_value()) {
-            std::cerr << "  * [ERROR] No valid scheduled times configured. Stopping daemon.\n";
-            return 1;
-        }
-
-        // Pure Intraday Loop (no scheduled bells)
-        if (!next_bell_tp.has_value()) {
-            config_.session_name = "INTRADAY";
-            run_immediate();
-            cycles_completed++;
-
-            // Interruptible sleep for configured interval
-            auto sleep_duration = *config_.intraday_interval;
-            auto sleep_chunk = std::chrono::milliseconds(100);
-            auto elapsed = std::chrono::milliseconds(0);
-
-            while (elapsed < sleep_duration && !active_stop->load(std::memory_order_relaxed)) {
-                std::this_thread::sleep_for(std::min(sleep_chunk, sleep_duration - elapsed));
-                elapsed += sleep_chunk;
-            }
-            continue;
-        }
-
-        auto time_to_bell = *next_bell_tp - now_sys;
-
-        // Check if approaching scheduled bell (within pre-warm window)
-        if (time_to_bell <= config_.pre_warm_lead_time && time_to_bell > std::chrono::seconds(0)) {
-            std::cout << "  * [BELL SCHEDULED] Approaching target " << next_bell_str << " UTC ("
-                      << std::chrono::duration_cast<std::chrono::seconds>(time_to_bell).count() << "s remaining)\n";
-
-            // Pre-warm WinHTTP TLS socket
-            if (!config_.dry_run) {
-                std::cout << "  * [TIMER] Pre-warming Charles Schwab gateway TLS socket...\n";
-                http_client_.prewarm();
-                std::cout << "  * [TIMER] Connection hot and ready.\n";
-            }
-
-            // Hybrid countdown to the target microsecond
-            auto monotonic_target = PrecisionClock::now() + std::chrono::duration_cast<PrecisionClock::Duration>(time_to_bell);
-            auto jitter = PrecisionClock::sleep_until(monotonic_target, config_.spin_threshold);
-
-            std::cout << "  * [BELL ALIGNED] Target reached! Measured clock jitter: "
-                      << (jitter.count() / 1000.0) << " us. Firing scheduled execution...\n";
-
-            config_.session_name = "BELL_" + next_bell_str;
-            run_immediate();
-            cycles_completed++;
-            continue;
-        }
-
-        // Continuous Intraday Evaluation (if enabled)
-        if (config_.intraday_interval.has_value()) {
-            // Check if sufficient lead time remains before next scheduled bell
-            if (time_to_bell > (config_.pre_warm_lead_time + *config_.intraday_interval)) {
-                config_.session_name = "INTRADAY";
-                run_immediate();
-                cycles_completed++;
-
-                // Interruptible sleep for configured interval
-                auto sleep_duration = *config_.intraday_interval;
-                auto sleep_chunk = std::chrono::milliseconds(100);
-                auto elapsed = std::chrono::milliseconds(0);
-
-                while (elapsed < sleep_duration && !active_stop->load(std::memory_order_relaxed)) {
-                    std::this_thread::sleep_for(std::min(sleep_chunk, sleep_duration - elapsed));
-                    elapsed += sleep_chunk;
-                }
-                continue;
-            }
-        }
-
-        // Coarse Sleep until pre-warm window
-        auto coarse_sleep = time_to_bell - config_.pre_warm_lead_time;
-        if (coarse_sleep > std::chrono::seconds(1)) {
-            // Sleep in 500ms interruptible intervals to ensure prompt Ctrl+C responsiveness
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-
-    std::cout << "\n================================================================================\n"
-              << "  [SCHWAB-EXECUTOR] DAEMON STOPPED CLEANLY (SIGINT / SHUTDOWN)\n"
-              << "================================================================================\n\n";
-
-    return 0;
 }
 
 } // namespace schwab

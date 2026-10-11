@@ -14,6 +14,21 @@ TEST_CASE("StrategyTargetWeight validation", "[strategy]") {
         REQUIRE_FALSE(StrategyTargetWeight{Symbol("SPY"), -0.10}.is_valid());
         REQUIRE_FALSE(StrategyTargetWeight{Symbol("SPY"), 1.10}.is_valid());
     }
+
+    SECTION("parse_targets parses valid string representation") {
+        auto targets = SampleRebalanceStrategy::parse_targets("SPY:0.60, QQQ:0.40 ");
+        REQUIRE(targets.size() == 2);
+        REQUIRE(targets[0].symbol == "SPY");
+        REQUIRE(targets[0].target_weight == 0.60);
+        REQUIRE(targets[1].symbol == "QQQ");
+        REQUIRE(targets[1].target_weight == 0.40);
+    }
+
+    SECTION("parse_targets handles empty or invalid strings safely") {
+        REQUIRE(SampleRebalanceStrategy::parse_targets("").empty());
+        REQUIRE(SampleRebalanceStrategy::parse_targets("invalid_token").empty());
+        REQUIRE(SampleRebalanceStrategy::parse_targets(":0.5,SPY:").empty());
+    }
 }
 
 TEST_CASE("SampleRebalanceStrategy order generation", "[strategy]") {
@@ -125,4 +140,5 @@ TEST_CASE("CompositeStrategy multi-strategy composition and attribution tagging"
         CHECK_FALSE(ord.tag.empty());
     }
 }
+
 

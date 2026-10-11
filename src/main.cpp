@@ -1,39 +1,41 @@
-#include "schwab/token_manager.hpp"
+#include "schwab/account_manager.hpp"
+#include "schwab/config.hpp"
+#include "schwab/execution_runner.hpp"
 #include "schwab/process_runner.hpp"
+#include "schwab/strategy.hpp"
 #include "schwab/time.hpp"
-#include "schwab/daemon.hpp"
+#include "schwab/token_manager.hpp"
 
-#include <iostream>
-#include <iomanip>
-#include <string_view>
+#include <charconv>
 #include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <string_view>
 
 namespace {
 
 void print_help() noexcept {
     std::cout << "\n================================================================================\n"
-              << "  Charles Schwab Low-Latency C++ Execution Engine (schwab-executor)\n"
+              << "  [SCHWAB-EXECUTOR] ULTRA-LOW LATENCY EXECUTION ENGINE & CLI\n"
               << "================================================================================\n"
-              << "Usage:\n"
-              << "  schwab_executor <command> [options]\n"
-              << "  schwab_executor --mode <command> [options]\n\n"
-              << "Commands:\n"
-              << "  auth     Verify active OAuth session or launch interactive login\n"
-              << "  status   Inspect active session diagnostics and live Schwab account status\n"
+              << "Usage: schwab_executor [mode] [options]\n\n"
+              << "Modes:\n"
+              << "  auth     Run OAuth 2.0 PKCE authentication handshake\n"
+              << "  status   Display current session status, token expiration, and accounts\n"
               << "  execute  Evaluate strategy and execute rebalance orders immediately\n"
-              << "  daemon   Launch persistent trading daemon (monitors market schedule)\n"
               << "  help     Display this help message\n\n"
               << "Options:\n"
               << "  --dry-run              Force simulation mode (does not submit live broker orders)\n"
               << "  --account-hash <hash>  Schwab encrypted account hash override\n"
               << "  --config <path>        Path to .env configuration file (default: .env)\n"
               << "  --token-path <path>    Path to .schwab_token.json (default: .schwab_token.json)\n"
-              << "  --telemetry-log <path> Path to append persistent execution logs\n"
+              << "  --telemetry-log <path> Path to append persistent execution logs (live execution only)\n"
               << "  --help, -h             Display this help message\n\n"
               << "Examples:\n"
               << "  schwab_executor status\n"
               << "  schwab_executor execute --dry-run\n"
-              << "  schwab_executor daemon --dry-run\n"
+              << "  schwab_executor execute\n"
               << "================================================================================\n\n";
 }
 
@@ -118,6 +120,26 @@ int handle_status(const std::filesystem::path& token_path) {
     return 0;
 }
 
+std::shared_ptr<schwab::IStrategy> resolve_strategy(const schwab::Config& cfg) {
+    // =========================================================================
+    // CUSTOM QUANTITATIVE STRATEGY EXTENSION HOOK:
+    // To execute a custom quantitative model, instantiate and return it here:
+    //   return std::make_shared<MyCustomStrategy>();
+    // =========================================================================
+
+    // Configuration-driven target weight rebalance strategy:
+    std::string_view targets_str = cfg.get_string("SCHWAB_STRATEGY_TARGETS");
+    if (!targets_str.empty()) {
+        auto targets = schwab::SampleRebalanceStrategy::parse_targets(targets_str);
+        if (!targets.empty()) {
+            return std::make_shared<schwab::SampleRebalanceStrategy>(std::move(targets));
+        }
+    }
+
+    // Default reference sample rebalance strategy
+    return std::make_shared<schwab::SampleRebalanceStrategy>();
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -150,7 +172,7 @@ int main(int argc, char* argv[]) {
             telemetry_log_str = argv[++i];
         } else if (arg == "--dry-run") {
             force_dry_run = true;
-        } else if (arg == "auth" || arg == "status" || arg == "execute" || arg == "daemon") {
+        } else if (arg == "auth" || arg == "status" || arg == "execute") {
             mode = arg;
         }
     }
@@ -162,35 +184,23 @@ int main(int argc, char* argv[]) {
     } else if (mode == "status") {
         return handle_status(token_path);
     } else if (mode == "execute") {
-        schwab::DaemonConfig dcfg;
-        dcfg.session_name = "EXECUTE";
-        dcfg.config_path = config_path_str;
-        dcfg.token_path = token_path;
-        dcfg.account_hash_override = std::string(account_hash_str);
+        schwab::ExecutionConfig exec_cfg;
+        exec_cfg.session_name = "EXECUTE";
+        exec_cfg.config_path = config_path_str;
+        exec_cfg.token_path = token_path;
+        exec_cfg.account_hash_override = std::string(account_hash_str);
         if (!telemetry_log_str.empty()) {
-            dcfg.telemetry_log_path = std::filesystem::path(telemetry_log_str);
+            exec_cfg.telemetry_log_path = std::filesystem::path(telemetry_log_str);
         }
         if (force_dry_run) {
-            dcfg.dry_run = true;
+            exec_cfg.dry_run = true;
         }
 
-        schwab::DaemonRunner runner(std::move(dcfg));
-        return runner.run_immediate();
-    } else if (mode == "daemon") {
-        schwab::DaemonConfig dcfg;
-        dcfg.session_name = "DAEMON";
-        dcfg.config_path = config_path_str;
-        dcfg.token_path = token_path;
-        dcfg.account_hash_override = std::string(account_hash_str);
-        if (!telemetry_log_str.empty()) {
-            dcfg.telemetry_log_path = std::filesystem::path(telemetry_log_str);
-        }
-        if (force_dry_run) {
-            dcfg.dry_run = true;
-        }
+        schwab::Config cfg = schwab::Config::load_from_file(config_path_str);
+        auto strat = resolve_strategy(cfg);
 
-        schwab::DaemonRunner runner(std::move(dcfg));
-        return runner.run_daemon();
+        schwab::ExecutionRunner runner(std::move(exec_cfg), std::move(strat));
+        return runner.execute();
     } else {
         std::cerr << "[ERROR] Unknown mode: '" << mode << "'. Use --help for usage.\n";
         return 1;

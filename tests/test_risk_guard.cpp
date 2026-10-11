@@ -71,8 +71,8 @@ TEST_CASE("RiskGuard nominal approval", "[risk_guard]") {
             .symbol = "NVDA"
         };
 
-        // 200 shares * $120 = $24,000 notional
-        auto res = guard.validate_order(ord, 500.0, 120.0);
+        // 200 shares * $120 = $24,000 notional (pass 70,000s UTC / 14:30 EST to be before cutoff)
+        auto res = guard.validate_order(ord, 500.0, 120.0, 70'000);
         REQUIRE(res.approved);
         CHECK(res.reason == RiskRejectReason::None);
     }

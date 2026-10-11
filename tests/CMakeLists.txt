@@ -16,7 +16,7 @@ add_executable(run_unit_tests
     test_clock.cpp
     test_strategy.cpp
     test_account_manager.cpp
-    test_daemon.cpp
+    test_execution_runner.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 

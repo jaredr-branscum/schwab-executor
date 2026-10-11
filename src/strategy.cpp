@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
+#include <charconv>
 
 namespace schwab {
 
@@ -135,6 +137,60 @@ std::vector<Order> SampleRebalanceStrategy::generate_orders(
     }
 
     return orders;
+}
+
+std::vector<StrategyTargetWeight> SampleRebalanceStrategy::parse_targets(std::string_view targets_str) {
+    std::vector<StrategyTargetWeight> targets;
+    size_t pos = 0;
+    while (pos < targets_str.size()) {
+        size_t next_comma = targets_str.find(',', pos);
+        std::string_view token = (next_comma == std::string_view::npos)
+            ? targets_str.substr(pos)
+            : targets_str.substr(pos, next_comma - pos);
+        pos = (next_comma == std::string_view::npos) ? targets_str.size() : next_comma + 1;
+
+        while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) {
+            token.remove_prefix(1);
+        }
+        while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) {
+            token.remove_suffix(1);
+        }
+        if (token.empty()) {
+            continue;
+        }
+
+        size_t colon_pos = token.find(':');
+        if (colon_pos == std::string_view::npos || colon_pos == 0 || colon_pos == token.size() - 1) {
+            continue;
+        }
+
+        std::string_view sym_sv = token.substr(0, colon_pos);
+        std::string_view weight_sv = token.substr(colon_pos + 1);
+
+        while (!sym_sv.empty() && std::isspace(static_cast<unsigned char>(sym_sv.front()))) {
+            sym_sv.remove_prefix(1);
+        }
+        while (!sym_sv.empty() && std::isspace(static_cast<unsigned char>(sym_sv.back()))) {
+            sym_sv.remove_suffix(1);
+        }
+
+        while (!weight_sv.empty() && std::isspace(static_cast<unsigned char>(weight_sv.front()))) {
+            weight_sv.remove_prefix(1);
+        }
+        while (!weight_sv.empty() && std::isspace(static_cast<unsigned char>(weight_sv.back()))) {
+            weight_sv.remove_suffix(1);
+        }
+
+        double weight = 0.0;
+        auto [ptr, ec] = std::from_chars(weight_sv.data(), weight_sv.data() + weight_sv.size(), weight);
+        if (ec == std::errc{} && ptr == weight_sv.data() + weight_sv.size()) {
+            StrategyTargetWeight tw{Symbol(sym_sv), weight};
+            if (tw.is_valid()) {
+                targets.push_back(tw);
+            }
+        }
+    }
+    return targets;
 }
 
 std::vector<Order> CompositeStrategy::generate_orders(
