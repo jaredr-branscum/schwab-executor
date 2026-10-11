@@ -167,4 +167,166 @@ std::vector<Quote> QuoteParser::parse_batch(
     return results;
 }
 
+std::optional<Quote> MarketDataManager::get_quote(
+    std::string_view symbol,
+    std::string* error_msg
+) const {
+    if (!client_) {
+        if (error_msg) *error_msg = "HttpClient instance is null";
+        return std::nullopt;
+    }
+    return fetch_quote(*client_, symbol, access_token_, error_msg);
+}
+
+std::vector<Quote> MarketDataManager::get_quotes(
+    std::span<const Symbol> symbols,
+    std::string* error_msg
+) const {
+    if (!client_) {
+        if (error_msg) *error_msg = "HttpClient instance is null";
+        return {};
+    }
+    return fetch_quotes_batch(*client_, symbols, access_token_, error_msg);
+}
+
+std::vector<Quote> MarketDataManager::get_quotes(
+    std::span<const std::string_view> symbols,
+    std::string* error_msg
+) const {
+    if (!client_) {
+        if (error_msg) *error_msg = "HttpClient instance is null";
+        return {};
+    }
+    return fetch_quotes_batch(*client_, symbols, access_token_, error_msg);
+}
+
+std::optional<Quote> MarketDataManager::fetch_quote(
+    HttpClient& client,
+    std::string_view symbol,
+    std::string_view access_token,
+    std::string* error_msg
+) {
+    if (symbol.empty()) {
+        if (error_msg) *error_msg = "Symbol is empty";
+        return std::nullopt;
+    }
+    if (access_token.empty()) {
+        if (error_msg) *error_msg = "Access token is empty";
+        return std::nullopt;
+    }
+
+    std::string path = "/marketdata/v1/";
+    path.append(symbol);
+    path.append("/quotes");
+
+    std::string auth_header = "Bearer ";
+    auth_header.append(access_token);
+
+    HttpResponse resp = client.get(path, auth_header);
+    if (resp.status_code != 200) {
+        if (error_msg) {
+            *error_msg = "HTTP " + std::to_string(resp.status_code) + ": " + resp.body;
+        }
+        return std::nullopt;
+    }
+
+    auto q_opt = QuoteParser::parse_single(resp.body, symbol);
+    if (!q_opt.has_value()) {
+        if (error_msg) {
+            *error_msg = "Failed to parse quote for symbol " + std::string(symbol);
+        }
+        return std::nullopt;
+    }
+
+    return q_opt;
+}
+
+std::vector<Quote> MarketDataManager::fetch_quotes_csv(
+    HttpClient& client,
+    std::string_view comma_delimited_symbols,
+    std::string_view access_token,
+    std::string* error_msg
+) {
+    if (comma_delimited_symbols.empty()) {
+        if (error_msg) *error_msg = "Symbols parameter is empty";
+        return {};
+    }
+    if (access_token.empty()) {
+        if (error_msg) *error_msg = "Access token is empty";
+        return {};
+    }
+
+    std::string path = "/marketdata/v1/quotes?symbols=";
+    path.append(comma_delimited_symbols);
+
+    std::string auth_header = "Bearer ";
+    auth_header.append(access_token);
+
+    HttpResponse resp = client.get(path, auth_header);
+    if (resp.status_code != 200) {
+        if (error_msg) {
+            *error_msg = "HTTP " + std::to_string(resp.status_code) + ": " + resp.body;
+        }
+        return {};
+    }
+
+    auto quotes = QuoteParser::parse_batch(resp.body);
+    if (quotes.empty() && error_msg) {
+        *error_msg = "Failed to parse quotes or empty quote set returned";
+    }
+    return quotes;
+}
+
+std::vector<Quote> MarketDataManager::fetch_quotes_batch(
+    HttpClient& client,
+    std::span<const Symbol> symbols,
+    std::string_view access_token,
+    std::string* error_msg
+) {
+    if (symbols.empty()) {
+        if (error_msg) *error_msg = "Symbols list is empty";
+        return {};
+    }
+
+    std::string csv;
+    for (const auto& sym : symbols) {
+        if (sym.empty()) continue;
+        if (!csv.empty()) csv.push_back(',');
+        csv.append(sym.view());
+    }
+
+    if (csv.empty()) {
+        if (error_msg) *error_msg = "Symbols list contains no valid symbols";
+        return {};
+    }
+
+    return fetch_quotes_csv(client, csv, access_token, error_msg);
+}
+
+std::vector<Quote> MarketDataManager::fetch_quotes_batch(
+    HttpClient& client,
+    std::span<const std::string_view> symbols,
+    std::string_view access_token,
+    std::string* error_msg
+) {
+    if (symbols.empty()) {
+        if (error_msg) *error_msg = "Symbols list is empty";
+        return {};
+    }
+
+    std::string csv;
+    for (const auto& sym : symbols) {
+        if (sym.empty()) continue;
+        if (!csv.empty()) csv.push_back(',');
+        csv.append(sym);
+    }
+
+    if (csv.empty()) {
+        if (error_msg) *error_msg = "Symbols list contains no valid symbols";
+        return {};
+    }
+
+    return fetch_quotes_csv(client, csv, access_token, error_msg);
+}
+
 } // namespace schwab

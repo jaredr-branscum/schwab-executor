@@ -2,6 +2,9 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "schwab/market_data.hpp"
 
+#include <functional>
+#include <memory>
+
 using namespace schwab;
 using Catch::Matchers::WithinAbs;
 
@@ -203,3 +206,221 @@ TEST_CASE("QuoteParser parse_batch Schwab JSON", "[market_data]") {
         CHECK(QuoteParser::parse_batch("{}").empty());
     }
 }
+
+namespace {
+
+struct StoredRequest {
+    HttpMethod method;
+    std::string path;
+    std::string auth_header;
+};
+
+class MockMarketTransport : public ITransport {
+public:
+    std::vector<StoredRequest> recorded_requests;
+    HttpResponse response_to_return{200, "{}", {}, std::chrono::microseconds{500}};
+    std::function<HttpResponse(const HttpRequest&)> custom_handler;
+
+    bool prewarm() override { return true; }
+    [[nodiscard]] bool is_connected() const noexcept override { return true; }
+    [[nodiscard]] bool is_idle_expired() const noexcept override { return false; }
+    void disconnect() noexcept override {}
+
+    [[nodiscard]] HttpResponse send(const HttpRequest& request) override {
+        recorded_requests.push_back(StoredRequest{
+            .method = request.method,
+            .path = std::string(request.path),
+            .auth_header = std::string(request.auth_header)
+        });
+        if (custom_handler) {
+            return custom_handler(request);
+        }
+        return response_to_return;
+    }
+};
+
+} // namespace
+
+TEST_CASE("MarketDataManager parameter guards and pre-flight validation", "[market_data]") {
+    HttpClient client;
+    std::string err;
+
+    SECTION("Empty symbol fails pre-flight") {
+        auto opt = MarketDataManager::fetch_quote(client, "", "token", &err);
+        CHECK_FALSE(opt.has_value());
+        CHECK(err == "Symbol is empty");
+    }
+
+    SECTION("Empty access token fails pre-flight") {
+        auto opt = MarketDataManager::fetch_quote(client, "AAPL", "", &err);
+        CHECK_FALSE(opt.has_value());
+        CHECK(err == "Access token is empty");
+    }
+
+    SECTION("Empty batch symbols list fails pre-flight") {
+        std::vector<Symbol> empty_symbols;
+        auto results = MarketDataManager::fetch_quotes_batch(client, empty_symbols, "token", &err);
+        CHECK(results.empty());
+        CHECK(err == "Symbols list is empty");
+    }
+
+    SECTION("Empty CSV symbols parameter fails pre-flight") {
+        auto results = MarketDataManager::fetch_quotes_csv(client, "", "token", &err);
+        CHECK(results.empty());
+        CHECK(err == "Symbols parameter is empty");
+    }
+
+    SECTION("Unbound MarketDataManager instance returns error") {
+        MarketDataManager mgr;
+        auto opt = mgr.get_quote("AAPL", &err);
+        CHECK_FALSE(opt.has_value());
+        CHECK(err == "HttpClient instance is null");
+
+        std::array<Symbol, 1> syms{Symbol("AAPL")};
+        auto results = mgr.get_quotes(syms, &err);
+        CHECK(results.empty());
+        CHECK(err == "HttpClient instance is null");
+    }
+}
+
+TEST_CASE("MarketDataManager fetch_quote executes HTTP GET and parses quote", "[market_data]") {
+    constexpr std::string_view sample_json = R"({
+        "AAPL": {
+            "symbol": "AAPL",
+            "quote": {
+                "bidPrice": 224.20,
+                "askPrice": 224.25,
+                "lastPrice": 224.22,
+                "mark": 224.23,
+                "totalVolume": 10000000,
+                "quoteTime": 1728676800000
+            }
+        }
+    })";
+
+    auto mock = std::make_unique<MockMarketTransport>();
+    auto* mock_ptr = mock.get();
+    mock_ptr->response_to_return = HttpResponse{200, std::string(sample_json), {}, std::chrono::microseconds{200}};
+
+    HttpClient client(std::move(mock));
+    std::string err;
+    auto opt = MarketDataManager::fetch_quote(client, "AAPL", "valid_oauth_token", &err);
+
+    REQUIRE(opt.has_value());
+    CHECK(opt->symbol.view() == "AAPL");
+    CHECK_THAT(opt->bid_price, WithinAbs(224.20, 1e-6));
+    CHECK_THAT(opt->ask_price, WithinAbs(224.25, 1e-6));
+    CHECK_THAT(opt->mark_price, WithinAbs(224.23, 1e-6));
+
+    REQUIRE(mock_ptr->recorded_requests.size() == 1);
+    const auto& req = mock_ptr->recorded_requests[0];
+    CHECK(req.path == "/marketdata/v1/AAPL/quotes");
+    CHECK(req.auth_header == "Bearer valid_oauth_token");
+}
+
+TEST_CASE("MarketDataManager fetch_quotes_batch executes batch query", "[market_data]") {
+    constexpr std::string_view batch_json = R"({
+        "SPY": {
+            "symbol": "SPY",
+            "quote": {
+                "bidPrice": 570.10,
+                "askPrice": 570.15,
+                "lastPrice": 570.12,
+                "mark": 570.12,
+                "totalVolume": 35000000,
+                "quoteTime": 1728676801000
+            }
+        },
+        "QQQ": {
+            "symbol": "QQQ",
+            "quote": {
+                "bidPrice": 485.50,
+                "askPrice": 485.58,
+                "lastPrice": 485.55,
+                "mark": 485.54,
+                "totalVolume": 25000000,
+                "quoteTime": 1728676802000
+            }
+        }
+    })";
+
+    auto mock = std::make_unique<MockMarketTransport>();
+    auto* mock_ptr = mock.get();
+    mock_ptr->response_to_return = HttpResponse{200, std::string(batch_json), {}, std::chrono::microseconds{300}};
+
+    HttpClient client(std::move(mock));
+    std::vector<Symbol> syms{Symbol("SPY"), Symbol("QQQ")};
+
+    auto quotes = MarketDataManager::fetch_quotes_batch(client, syms, "secret_token");
+    REQUIRE(quotes.size() == 2);
+
+    REQUIRE(mock_ptr->recorded_requests.size() == 1);
+    CHECK(mock_ptr->recorded_requests[0].path == "/marketdata/v1/quotes?symbols=SPY,QQQ");
+}
+
+TEST_CASE("MarketDataManager HTTP error handling", "[market_data]") {
+    SECTION("HTTP 401 Unauthorized returns nullopt with diagnostics") {
+        auto mock = std::make_unique<MockMarketTransport>();
+        mock->response_to_return = HttpResponse{401, "{\"error\":\"Unauthorized\"}", {}, std::chrono::microseconds{100}};
+
+        HttpClient client(std::move(mock));
+        std::string err;
+        auto opt = MarketDataManager::fetch_quote(client, "AAPL", "bad_token", &err);
+        CHECK_FALSE(opt.has_value());
+        CHECK(err.find("401") != std::string::npos);
+    }
+
+    SECTION("HTTP 500 Internal Error returns empty vector") {
+        auto mock = std::make_unique<MockMarketTransport>();
+        mock->response_to_return = HttpResponse{500, "{\"error\":\"Internal Server Error\"}", {}, std::chrono::microseconds{100}};
+
+        HttpClient client(std::move(mock));
+        std::string err;
+        std::vector<Symbol> syms{Symbol("AAPL")};
+        auto quotes = MarketDataManager::fetch_quotes_batch(client, syms, "token", &err);
+        CHECK(quotes.empty());
+        CHECK(err.find("500") != std::string::npos);
+    }
+
+    SECTION("HTTP 200 with invalid JSON body fails with parser diagnostic") {
+        auto mock = std::make_unique<MockMarketTransport>();
+        mock->response_to_return = HttpResponse{200, "not a valid json object", {}, std::chrono::microseconds{100}};
+
+        HttpClient client(std::move(mock));
+        std::string err;
+        auto opt = MarketDataManager::fetch_quote(client, "AAPL", "token", &err);
+        CHECK_FALSE(opt.has_value());
+        CHECK(err.find("Failed to parse quote") != std::string::npos);
+    }
+}
+
+TEST_CASE("MarketDataManager stateful instance workflow", "[market_data]") {
+    constexpr std::string_view sample_json = R"({
+        "AAPL": {
+            "symbol": "AAPL",
+            "quote": {
+                "bidPrice": 224.20,
+                "askPrice": 224.25,
+                "lastPrice": 224.22,
+                "mark": 224.23,
+                "totalVolume": 10000000,
+                "quoteTime": 1728676800000
+            }
+        }
+    })";
+
+    auto mock = std::make_unique<MockMarketTransport>();
+    mock->response_to_return = HttpResponse{200, std::string(sample_json), {}, std::chrono::microseconds{100}};
+
+    HttpClient client(std::move(mock));
+    MarketDataManager mgr(&client, "bound_token");
+
+    CHECK(mgr.client() == &client);
+    CHECK(mgr.access_token() == "bound_token");
+
+    auto opt = mgr.get_quote("AAPL");
+    REQUIRE(opt.has_value());
+    CHECK(opt->symbol.view() == "AAPL");
+    CHECK_THAT(opt->mark_price, WithinAbs(224.23, 1e-6));
+}
+
