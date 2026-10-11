@@ -20,6 +20,8 @@ TEST_CASE("RiskRejectReason string representation", "[risk_guard]") {
     CHECK(to_string(RiskRejectReason::PriceCollarViolation) == "PRICE_COLLAR_VIOLATION");
     CHECK(to_string(RiskRejectReason::MocCutoffExceeded) == "MOC_CUTOFF_EXCEEDED");
     CHECK(to_string(RiskRejectReason::DryRunIntercepted) == "DRY_RUN_INTERCEPTED");
+    CHECK(to_string(RiskRejectReason::CrossedBookAnomaly) == "CROSSED_BOOK_ANOMALY");
+    CHECK(to_string(RiskRejectReason::MaxSpreadExceeded) == "MAX_SPREAD_EXCEEDED");
 }
 
 TEST_CASE("RiskGuard nominal approval", "[risk_guard]") {
@@ -270,4 +272,164 @@ TEST_CASE("RiskGuard Market-on-Close (MOC) cutoff gate", "[risk_guard]") {
         CHECK(res.reason == RiskRejectReason::None);
     }
 }
+
+TEST_CASE("RiskGuard real-time quote validation, spread circuit breaker, and spread-aware collars", "[risk_guard]") {
+    RiskLimits limits{
+        .max_order_notional = 100'000.0,
+        .max_order_quantity = 5'000.0,
+        .max_position_notional = 250'000.0,
+        .price_collar_percent = 0.03, // 3%
+        .max_bid_ask_spread_bps = 50.0, // 50 bps (0.50%)
+        .dry_run = false,
+        .reject_crossed_book = true
+    };
+
+    RiskGuard guard(limits);
+
+    Quote valid_quote{
+        .symbol = Symbol("SPY"),
+        .bid_price = 500.00,
+        .ask_price = 500.20,
+        .last_price = 500.10,
+        .mark_price = 500.10,
+        .total_volume = 1'000'000,
+        .quote_time_ms = 1728676800000
+    };
+
+    SECTION("Nominal approval: market order with tight spread quote") {
+        Order ord{
+            .quantity = 100.0,
+            .side = OrderSide::Buy,
+            .type = OrderType::Market,
+            .symbol = "SPY"
+        };
+        auto res = guard.validate_order(ord, valid_quote, 0.0);
+        REQUIRE(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
+
+    SECTION("Rejection: Quote symbol mismatch") {
+        Order ord{
+            .quantity = 100.0,
+            .side = OrderSide::Buy,
+            .type = OrderType::Market,
+            .symbol = "QQQ"
+        };
+        auto res = guard.validate_order(ord, valid_quote, 0.0);
+        REQUIRE_FALSE(res.approved);
+        CHECK(res.reason == RiskRejectReason::InvalidOrderStructure);
+        CHECK(res.message.find("symbol") != std::string_view::npos);
+    }
+
+    SECTION("Rejection: Invalid quote structure") {
+        Order ord{
+            .quantity = 100.0,
+            .side = OrderSide::Buy,
+            .type = OrderType::Market,
+            .symbol = "SPY"
+        };
+        Quote bad_quote{
+            .symbol = Symbol("SPY"),
+            .bid_price = 0.0,
+            .ask_price = 0.0,
+            .last_price = 0.0,
+            .mark_price = 0.0
+        };
+        auto res = guard.validate_order(ord, bad_quote, 0.0);
+        REQUIRE_FALSE(res.approved);
+        CHECK(res.reason == RiskRejectReason::InvalidOrderStructure);
+    }
+
+    SECTION("Rejection: Crossed book anomaly (bid > ask)") {
+        Order ord{
+            .quantity = 100.0,
+            .side = OrderSide::Buy,
+            .type = OrderType::Market,
+            .symbol = "SPY"
+        };
+        Quote crossed_quote{
+            .symbol = Symbol("SPY"),
+            .bid_price = 502.00,
+            .ask_price = 500.00,
+            .last_price = 501.00,
+            .mark_price = 501.00
+        };
+        auto res = guard.validate_order(ord, crossed_quote, 0.0);
+        REQUIRE_FALSE(res.approved);
+        CHECK(res.reason == RiskRejectReason::CrossedBookAnomaly);
+        CHECK(res.message.find("crossed") != std::string_view::npos);
+    }
+
+    SECTION("Rejection: Bid-ask spread exceeds maximum allowed threshold (50 bps)") {
+        Order ord{
+            .quantity = 100.0,
+            .side = OrderSide::Buy,
+            .type = OrderType::Market,
+            .symbol = "SPY"
+        };
+        // Spread $5.00 on $500 mark = 100 bps (exceeds 50 bps limit)
+        Quote wide_quote{
+            .symbol = Symbol("SPY"),
+            .bid_price = 497.50,
+            .ask_price = 502.50,
+            .last_price = 500.00,
+            .mark_price = 500.00
+        };
+        auto res = guard.validate_order(ord, wide_quote, 0.0);
+        REQUIRE_FALSE(res.approved);
+        CHECK(res.reason == RiskRejectReason::MaxSpreadExceeded);
+        CHECK(res.message.find("spread") != std::string_view::npos);
+    }
+
+    SECTION("Spread-aware Buy Limit collar pegged to Ask price") {
+        // valid_quote: ask_price = 500.20, collar = 3% -> max allowed = 500.20 * 1.03 = 515.206
+        Order buy_pass{
+            .quantity = 10.0,
+            .limit_price = 510.00, // +1.95% over ask, within 3% collar
+            .side = OrderSide::Buy,
+            .type = OrderType::Limit,
+            .symbol = "SPY"
+        };
+        auto res_pass = guard.validate_order(buy_pass, valid_quote, 0.0);
+        REQUIRE(res_pass.approved);
+        CHECK(res_pass.reason == RiskRejectReason::None);
+
+        Order buy_breach{
+            .quantity = 10.0,
+            .limit_price = 520.00, // > 515.206, breaches collar
+            .side = OrderSide::Buy,
+            .type = OrderType::Limit,
+            .symbol = "SPY"
+        };
+        auto res_breach = guard.validate_order(buy_breach, valid_quote, 0.0);
+        REQUIRE_FALSE(res_breach.approved);
+        CHECK(res_breach.reason == RiskRejectReason::PriceCollarViolation);
+    }
+
+    SECTION("Spread-aware Sell Limit collar pegged to Bid price") {
+        // valid_quote: bid_price = 500.00, collar = 3% -> min allowed = 500.00 * (1 - 0.03) = 485.00
+        Order sell_pass{
+            .quantity = 10.0,
+            .limit_price = 490.00, // -2% from bid, within 3% collar
+            .side = OrderSide::Sell,
+            .type = OrderType::Limit,
+            .symbol = "SPY"
+        };
+        auto res_pass = guard.validate_order(sell_pass, valid_quote, 100.0);
+        REQUIRE(res_pass.approved);
+        CHECK(res_pass.reason == RiskRejectReason::None);
+
+        Order sell_breach{
+            .quantity = 10.0,
+            .limit_price = 480.00, // < 485.00, breaches collar
+            .side = OrderSide::Sell,
+            .type = OrderType::Limit,
+            .symbol = "SPY"
+        };
+        auto res_breach = guard.validate_order(sell_breach, valid_quote, 100.0);
+        REQUIRE_FALSE(res_breach.approved);
+        CHECK(res_breach.reason == RiskRejectReason::PriceCollarViolation);
+    }
+}
+
 

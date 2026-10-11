@@ -1,5 +1,6 @@
 #pragma once
 
+#include "schwab/market_data.hpp"
 #include "schwab/order.hpp"
 #include <chrono>
 #include <string_view>
@@ -17,7 +18,9 @@ enum class RiskRejectReason : uint8_t {
     ExceedsMaxPositionNotional,
     PriceCollarViolation,
     MocCutoffExceeded,
-    DryRunIntercepted
+    DryRunIntercepted,
+    CrossedBookAnomaly,
+    MaxSpreadExceeded
 };
 
 // Zero-allocation string representation for reject reasons
@@ -31,6 +34,8 @@ enum class RiskRejectReason : uint8_t {
         case RiskRejectReason::PriceCollarViolation: return "PRICE_COLLAR_VIOLATION";
         case RiskRejectReason::MocCutoffExceeded: return "MOC_CUTOFF_EXCEEDED";
         case RiskRejectReason::DryRunIntercepted: return "DRY_RUN_INTERCEPTED";
+        case RiskRejectReason::CrossedBookAnomaly: return "CROSSED_BOOK_ANOMALY";
+        case RiskRejectReason::MaxSpreadExceeded: return "MAX_SPREAD_EXCEEDED";
     }
     return "UNKNOWN";
 }
@@ -54,9 +59,11 @@ struct RiskLimits {
     double max_order_quantity{10'000.0};        // Max share count per single order (offset 8..15)
     double max_position_notional{500'000.0};    // Max $ position exposure per symbol (offset 16..23)
     double price_collar_percent{0.05};          // Max allowed price deviation (5%) (offset 24..31)
-    uint32_t moc_cutoff_seconds_utc{75'000};    // Cutoff in seconds since UTC midnight (75,000s = 20:50:00 UTC / 15:50 EST) (offset 32..35)
-    bool enforce_moc_cutoff{true};              // Enforce exchange MOC cutoff deadline (offset 36)
-    bool dry_run{false};                        // Intercept orders when dry-run is active (offset 37)
+    double max_bid_ask_spread_bps{50.0};        // Max allowed bid-ask spread in bps (e.g. 50 bps = 0.50%) (offset 32..39)
+    uint32_t moc_cutoff_seconds_utc{75'000};    // Cutoff in seconds since UTC midnight (75,000s = 20:50:00 UTC / 15:50 EST) (offset 40..43)
+    bool enforce_moc_cutoff{true};              // Enforce exchange MOC cutoff deadline (offset 44)
+    bool dry_run{false};                        // Intercept orders when dry-run is active (offset 45)
+    bool reject_crossed_book{true};             // Reject orders when NBBO is crossed (offset 46)
 };
 static_assert(sizeof(RiskLimits) <= 64, "RiskLimits must fit within single 64-byte CPU cache line");
 
@@ -154,6 +161,170 @@ public:
                         .approved = false,
                         .reason = RiskRejectReason::PriceCollarViolation,
                         .message = "Sell limit price breaches lower price collar"
+                    };
+                }
+            }
+        }
+
+        // Resulting Position Notional Limit Check
+        if (limits_.max_position_notional > 0.0) {
+            const double delta = (order.side == OrderSide::Buy) ? order.quantity : -order.quantity;
+            const double resulting_quantity = current_position_quantity + delta;
+            const double resulting_notional = std::abs(resulting_quantity) * ref_price;
+
+            if (resulting_notional > limits_.max_position_notional) [[unlikely]] {
+                return RiskCheckResult{
+                    .approved = false,
+                    .reason = RiskRejectReason::ExceedsMaxPositionNotional,
+                    .message = "Resulting position notional exceeds max_position_notional threshold"
+                };
+            }
+        }
+
+        // Dry-Run Interceptor
+        if (limits_.dry_run) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::DryRunIntercepted,
+                .message = "Order intercepted: dry-run mode active"
+            };
+        }
+
+        // All Pre-Trade Risk Gates Passed
+        return RiskCheckResult{
+            .approved = true,
+            .reason = RiskRejectReason::None,
+            .message = "Approved"
+        };
+    }
+
+    /// @brief Evaluates an order against real-time quote and pre-trade risk thresholds (inlined on hot path)
+    /// @param order The order to validate
+    /// @param quote Real-time NBBO quote with bid, ask, mark prices, and volume
+    /// @param current_position_quantity Existing shares held in this symbol (default 0.0)
+    /// @param current_time_seconds_utc Current time in seconds since midnight UTC (0 for auto now())
+    /// @return RiskCheckResult indicating approval or rejection reason
+    [[nodiscard]] inline RiskCheckResult validate_order(
+        const Order& order,
+        const Quote& quote,
+        double current_position_quantity = 0.0,
+        uint32_t current_time_seconds_utc = 0) const noexcept {
+
+        if (!order.is_valid()) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::InvalidOrderStructure,
+                .message = "Order fails basic structural validity (empty symbol, non-positive quantity, or missing limit price)"
+            };
+        }
+
+        // Quote and Symbol Integrity Gate
+        if (!quote.is_valid()) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::InvalidOrderStructure,
+                .message = "Quote contains invalid pricing data or empty symbol"
+            };
+        }
+
+        if (quote.symbol != order.symbol) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::InvalidOrderStructure,
+                .message = "Quote symbol does not match order symbol"
+            };
+        }
+
+        // Market-On-Close (MOC) Regulatory Cutoff Gate
+        if (order.type == OrderType::MarketOnClose && limits_.enforce_moc_cutoff) [[unlikely]] {
+            uint32_t sec_utc = current_time_seconds_utc;
+            if (sec_utc == 0) {
+                auto now = std::chrono::system_clock::now();
+                auto dp = std::chrono::floor<std::chrono::days>(now);
+                sec_utc = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(now - dp).count());
+            }
+            if (sec_utc > limits_.moc_cutoff_seconds_utc) [[unlikely]] {
+                return RiskCheckResult{
+                    .approved = false,
+                    .reason = RiskRejectReason::MocCutoffExceeded,
+                    .message = "Market-on-close order rejected: submitted after exchange MOC cutoff deadline (20:50 UTC / 15:50 EST)"
+                };
+            }
+        }
+
+        // Crossed-Book Anomaly Gate (Circuit breaker for inverted NBBO)
+        if (limits_.reject_crossed_book && quote.is_crossed()) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::CrossedBookAnomaly,
+                .message = "Order rejected: crossed order book anomaly (bid price exceeds ask price)"
+            };
+        }
+
+        // Max Bid-Ask Spread Circuit Breaker (Protects against illiquidity / wide market spreads)
+        if (limits_.max_bid_ask_spread_bps > 0.0 && quote.spread_bps() > limits_.max_bid_ask_spread_bps) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::MaxSpreadExceeded,
+                .message = "Order rejected: bid-ask spread exceeds maximum allowed spread threshold (max_bid_ask_spread_bps)"
+            };
+        }
+
+        // Reference Price Resolution
+        double ref_price = 0.0;
+        if (order.type == OrderType::Limit && order.limit_price.has_value() && *order.limit_price > 0.0) {
+            ref_price = *order.limit_price;
+        } else {
+            ref_price = quote.reference_price();
+            if (ref_price <= 0.0) [[unlikely]] {
+                return RiskCheckResult{
+                    .approved = false,
+                    .reason = RiskRejectReason::InvalidOrderStructure,
+                    .message = "Market/MOC order lacks positive reference market price for valuation"
+                };
+            }
+        }
+
+        // Single Order Notional Limit Check ($ Value)
+        const double notional = order.quantity * ref_price;
+        if (limits_.max_order_notional > 0.0 && notional > limits_.max_order_notional) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::ExceedsMaxOrderNotional,
+                .message = "Order notional exceeds max_order_notional threshold"
+            };
+        }
+
+        // Single Order Quantity Limit Check (Shares)
+        if (limits_.max_order_quantity > 0.0 && order.quantity > limits_.max_order_quantity) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::ExceedsMaxOrderQuantity,
+                .message = "Order quantity exceeds max_order_quantity threshold"
+            };
+        }
+
+        // Dynamic Spread-Aware Price Collar Check (Pegged to inside market: Ask for Buy, Bid for Sell)
+        if (order.type == OrderType::Limit && limits_.price_collar_percent > 0.0) {
+            const double limit_val = *order.limit_price;
+            if (order.side == OrderSide::Buy) {
+                const double baseline = (quote.ask_price > 0.0) ? quote.ask_price : quote.reference_price();
+                const double max_allowed = baseline * (1.0 + limits_.price_collar_percent);
+                if (limit_val > max_allowed) [[unlikely]] {
+                    return RiskCheckResult{
+                        .approved = false,
+                        .reason = RiskRejectReason::PriceCollarViolation,
+                        .message = "Buy limit price exceeds upper spread-aware price collar"
+                    };
+                }
+            } else if (order.side == OrderSide::Sell) {
+                const double baseline = (quote.bid_price > 0.0) ? quote.bid_price : quote.reference_price();
+                const double min_allowed = baseline * (1.0 - limits_.price_collar_percent);
+                if (limit_val < min_allowed) [[unlikely]] {
+                    return RiskCheckResult{
+                        .approved = false,
+                        .reason = RiskRejectReason::PriceCollarViolation,
+                        .message = "Sell limit price breaches lower spread-aware price collar"
                     };
                 }
             }
