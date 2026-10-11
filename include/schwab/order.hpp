@@ -239,7 +239,7 @@ struct Order {
         return 0.0;
     }
 };
-static_assert(sizeof(Order) <= 64, "Order must fit within a single 64-byte CPU cache line");
+static_assert(sizeof(Order) <= 64, "Order must fit within single 64-byte CPU cache line");
 
 /// @brief Account position snapshot
 /// Struct contents should fit within single 64-byte L1 CPU cache line
@@ -267,6 +267,6 @@ struct Position {
         return (basis > 0.0) ? (unrealized_pnl() / basis) : 0.0;
     }
 };
-static_assert(sizeof(Position) <= 64, "Position must fit within a single 64-byte CPU cache line");
+static_assert(sizeof(Position) <= 64, "Position must fit within single 64-byte CPU cache line");
 
 } // namespace schwab

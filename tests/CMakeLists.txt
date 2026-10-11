@@ -16,6 +16,7 @@ add_executable(run_unit_tests
     test_clock.cpp
     test_strategy.cpp
     test_account_manager.cpp
+    test_market_data.cpp
     test_execution_runner.cpp
 )
 

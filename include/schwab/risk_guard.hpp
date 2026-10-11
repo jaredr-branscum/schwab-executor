@@ -58,7 +58,7 @@ struct RiskLimits {
     bool enforce_moc_cutoff{true};              // Enforce exchange MOC cutoff deadline (offset 36)
     bool dry_run{false};                        // Intercept orders when dry-run is active (offset 37)
 };
-static_assert(sizeof(RiskLimits) <= 64, "RiskLimits must fit within a single 64-byte CPU cache line");
+static_assert(sizeof(RiskLimits) <= 64, "RiskLimits must fit within single 64-byte CPU cache line");
 
 /// @brief High-speed, zero-allocation pre-trade risk guard
 class RiskGuard {

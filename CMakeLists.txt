@@ -55,6 +55,7 @@ add_library(schwab_core
     src/clock.cpp
     src/strategy.cpp
     src/account_manager.cpp
+    src/market_data.cpp
     src/execution_runner.cpp
 )
 
