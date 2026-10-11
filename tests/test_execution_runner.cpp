@@ -490,3 +490,89 @@ TEST_CASE("ExecutionRunner real-time market data valuation and fallback", "[exec
     std::filesystem::remove(temp_env, ec);
 }
 
+TEST_CASE("ExecutionRunner format_reconciliation_table output", "[execution_runner]") {
+    BatchReconciliationReport recon;
+
+    OrderReconciliationResult r1;
+    r1.symbol = Symbol("AAPL");
+    r1.side = OrderSide::Buy;
+    r1.ordered_quantity = 50.0;
+    r1.filled_quantity = 50.0;
+    r1.average_fill_price = 150.25;
+    r1.final_state = OrderExecutionState::Filled;
+    r1.is_terminal = true;
+    r1.is_filled = true;
+    r1.order_id = "ORD_101";
+    r1.slippage = calculate_slippage(OrderSide::Buy, 150.00, 150.25); // +16.7 bps
+
+    OrderReconciliationResult r2;
+    r2.symbol = Symbol("SPY");
+    r2.side = OrderSide::Sell;
+    r2.ordered_quantity = 20.0;
+    r2.filled_quantity = 20.0;
+    r2.average_fill_price = 575.50;
+    r2.final_state = OrderExecutionState::Filled;
+    r2.is_terminal = true;
+    r2.is_filled = true;
+    r2.order_id = "ORD_102";
+    r2.slippage = calculate_slippage(OrderSide::Sell, 575.00, 575.50); // -8.7 bps (favorable)
+
+    recon.orders = {r1, r2};
+    recon.total_tracked = 2;
+    recon.total_filled = 2;
+    recon.total_cancelled = 0;
+    recon.total_rejected = 0;
+    recon.total_timed_out = 0;
+    recon.all_terminal = true;
+    recon.all_filled = true;
+    recon.average_slippage_bps = (r1.slippage.slippage_bps + r2.slippage.slippage_bps) / 2.0;
+    recon.elapsed_time = std::chrono::microseconds{15400};
+
+    std::string table = ExecutionRunner::format_reconciliation_table(recon);
+
+    REQUIRE_FALSE(table.empty());
+    CHECK(table.find("POST-TRADE FILL & SLIPPAGE RECONCILIATION") != std::string::npos);
+    CHECK(table.find("AAPL") != std::string::npos);
+    CHECK(table.find("SPY") != std::string::npos);
+    CHECK(table.find("BUY") != std::string::npos);
+    CHECK(table.find("SELL") != std::string::npos);
+    CHECK(table.find("150.25") != std::string::npos);
+    CHECK(table.find("575.50") != std::string::npos);
+    CHECK(table.find("bps") != std::string::npos);
+    CHECK(table.find("ORD_101") != std::string::npos);
+    CHECK(table.find("ORD_102") != std::string::npos);
+    CHECK(table.find("Total Tracked: 2") != std::string::npos);
+    CHECK(table.find("Filled: 2") != std::string::npos);
+    CHECK(table.find("Avg Slippage:") != std::string::npos);
+}
+
+TEST_CASE("ExecutionRunner dry-run post-dispatch fill reconciliation", "[execution_runner]") {
+    std::vector<StrategyTargetWeight> targets = {
+        {Symbol("SPY"), 0.50}
+    };
+    auto strat = std::make_shared<SampleRebalanceStrategy>(targets);
+
+    Position pos_spy{.quantity = 100.0, .average_price = 450.0, .current_price = 500.0, .symbol = Symbol("SPY")};
+    std::vector<Position> positions = {pos_spy};
+    double cash = 0.0;
+
+    ExecutionConfig dry_cfg;
+    dry_cfg.dry_run = true;
+    dry_cfg.track_fills = true;
+
+    ExecutionRunner runner(dry_cfg, strat);
+    int code = runner.execute(positions, cash);
+
+    REQUIRE(code == 0);
+    const auto& last_recon = runner.last_reconciliation_report();
+    REQUIRE(last_recon.has_value());
+    CHECK(last_recon->total_tracked == 1);
+    CHECK(last_recon->total_filled == 1);
+    CHECK(last_recon->all_terminal);
+    CHECK(last_recon->all_filled);
+    CHECK(last_recon->orders[0].symbol.view() == "SPY");
+    CHECK(last_recon->orders[0].side == OrderSide::Sell);
+    CHECK(last_recon->orders[0].is_filled);
+}
+
+

@@ -436,3 +436,62 @@ TEST_CASE("OrderTracker reconcile_report preserves sequence and aggregates faile
     CHECK(recon.orders[2].is_filled);
     CHECK_THAT(recon.orders[2].average_fill_price, WithinAbs(410.0, 1e-9));
 }
+
+TEST_CASE("OrderTracker reconcile_report computes slippage with pre-trade quotes", "[order_tracker]") {
+    auto mock = std::make_unique<MockTransport>();
+    MockTransport* raw_mock = mock.get();
+
+    raw_mock->handler = [](const HttpRequest& req) {
+        HttpResponse resp;
+        resp.status_code = 200;
+        if (req.path.find("/orders/601") != std::string_view::npos) {
+            // AAPL Buy filled at 150.30 (Quote ask was 150.00 -> +20 bps adverse slippage)
+            resp.body = make_schwab_order_json("601", "AAPL", "BUY", "FILLED", 100.0, 100.0, 150.30);
+        } else if (req.path.find("/orders/602") != std::string_view::npos) {
+            // MSFT Sell filled at 400.40 (Quote bid was 400.00 -> -10 bps favorable slippage)
+            resp.body = make_schwab_order_json("602", "MSFT", "SELL", "FILLED", 50.0, 50.0, 400.40);
+        }
+        return resp;
+    };
+
+    HttpClient client(std::move(mock));
+    OrderTracker tracker(client, OrderTrackerConfig{
+        .account_hash = "SLIP_ACC",
+        .polling_interval_ms = 5,
+        .timeout_ms = 500
+    });
+
+    ExecutionReport exec_report;
+    OrderExecutionResult r1;
+    r1.order.symbol = Symbol{"AAPL"};
+    r1.order.side = OrderSide::Buy;
+    r1.order.quantity = 100.0;
+    r1.success = true;
+    r1.order_id = "601";
+    exec_report.results.push_back(r1);
+
+    OrderExecutionResult r2;
+    r2.order.symbol = Symbol{"MSFT"};
+    r2.order.side = OrderSide::Sell;
+    r2.order.quantity = 50.0;
+    r2.success = true;
+    r2.order_id = "602";
+    exec_report.results.push_back(r2);
+
+    Quote q1; q1.symbol = Symbol{"AAPL"}; q1.ask_price = 150.00; q1.bid_price = 149.90; q1.last_price = 149.95;
+    Quote q2; q2.symbol = Symbol{"MSFT"}; q2.ask_price = 400.10; q2.bid_price = 400.00; q2.last_price = 400.05;
+    std::vector<Quote> quotes = {q1, q2};
+
+    BatchReconciliationReport recon = tracker.reconcile_report(exec_report, "test_token", quotes);
+
+    REQUIRE(recon.total_filled == 2);
+    REQUIRE(recon.orders[0].slippage.has_slippage);
+    CHECK_THAT(recon.orders[0].slippage.slippage_bps, WithinAbs(20.0, 1e-6));
+
+    REQUIRE(recon.orders[1].slippage.has_slippage);
+    CHECK_THAT(recon.orders[1].slippage.slippage_bps, WithinAbs(-10.0, 1e-6));
+
+    // Average slippage: (20.0 + (-10.0)) / 2 = +5.0 bps
+    CHECK_THAT(recon.average_slippage_bps, WithinAbs(5.0, 1e-6));
+}
+

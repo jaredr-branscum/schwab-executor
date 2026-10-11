@@ -155,20 +155,42 @@ OrderReconciliationResult OrderTracker::poll_order(
 
 void OrderTracker::compute_batch_summary(
     BatchReconciliationReport& report,
-    std::chrono::microseconds elapsed_time
+    std::chrono::microseconds elapsed_time,
+    std::span<const Quote> quotes
 ) noexcept {
     report.total_tracked = report.orders.size();
     report.total_filled = 0;
     report.total_cancelled = 0;
     report.total_rejected = 0;
     report.total_timed_out = 0;
+    report.average_slippage_bps = 0.0;
     report.all_terminal = true;
     report.all_filled = true;
     report.elapsed_time = elapsed_time;
 
-    for (const auto& ord_res : report.orders) {
+    double total_slippage_bps = 0.0;
+    size_t slippage_count = 0;
+
+    for (auto& ord_res : report.orders) {
         if (ord_res.is_filled) {
             report.total_filled++;
+
+            // If pre-trade quotes provided, compute slippage against arrival/reference price
+            if (!quotes.empty() && ord_res.average_fill_price > 0.0 && !ord_res.slippage.has_slippage) {
+                for (const auto& q : quotes) {
+                    if (q.symbol == ord_res.symbol && q.is_valid()) {
+                        double ref_price = (ord_res.side == OrderSide::Buy) ? q.ask_price : q.bid_price;
+                        if (ref_price <= 0.0) ref_price = q.reference_price();
+                        ord_res.slippage = calculate_slippage(ord_res.side, ref_price, ord_res.average_fill_price);
+                        break;
+                    }
+                }
+            }
+
+            if (ord_res.slippage.has_slippage) {
+                total_slippage_bps += ord_res.slippage.slippage_bps;
+                slippage_count++;
+            }
         } else {
             report.all_filled = false;
         }
@@ -184,11 +206,16 @@ void OrderTracker::compute_batch_summary(
             report.all_terminal = false;
         }
     }
+
+    if (slippage_count > 0) {
+        report.average_slippage_bps = total_slippage_bps / static_cast<double>(slippage_count);
+    }
 }
 
 BatchReconciliationReport OrderTracker::reconcile_orders(
     std::span<const std::string> order_ids,
-    std::string_view access_token
+    std::string_view access_token,
+    std::span<const Quote> quotes
 ) {
     BatchReconciliationReport report;
     if (order_ids.empty()) {
@@ -206,13 +233,14 @@ BatchReconciliationReport OrderTracker::reconcile_orders(
         std::chrono::steady_clock::now() - start_time
     );
 
-    compute_batch_summary(report, elapsed);
+    compute_batch_summary(report, elapsed, quotes);
     return report;
 }
 
 BatchReconciliationReport OrderTracker::reconcile_report(
     const ExecutionReport& report,
-    std::string_view access_token
+    std::string_view access_token,
+    std::span<const Quote> quotes
 ) {
     BatchReconciliationReport final_report;
     if (report.results.empty()) {
@@ -248,7 +276,7 @@ BatchReconciliationReport OrderTracker::reconcile_report(
         std::chrono::steady_clock::now() - start_time
     );
 
-    compute_batch_summary(final_report, elapsed);
+    compute_batch_summary(final_report, elapsed, quotes);
     return final_report;
 }
 

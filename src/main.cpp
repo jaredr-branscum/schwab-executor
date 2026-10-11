@@ -31,6 +31,7 @@ void print_help() noexcept {
               << "  --config <path>        Path to .env configuration file (default: .env)\n"
               << "  --token-path <path>    Path to .schwab_token.json (default: .schwab_token.json)\n"
               << "  --telemetry-log <path> Path to append persistent execution logs (live execution only)\n"
+              << "  --track-fills          Poll broker post-dispatch to verify fills and calculate slippage\n"
               << "  --help, -h             Display this help message\n\n"
               << "Examples:\n"
               << "  schwab_executor status\n"
@@ -158,6 +159,7 @@ int main(int argc, char* argv[]) {
     std::string_view account_hash_str = "";
     std::string_view telemetry_log_str = "";
     bool force_dry_run = false;
+    bool force_track_fills = false;
 
     // Zero-allocation CLI argument parsing using string_view slices
     for (int i = 1; i < argc; ++i) {
@@ -177,6 +179,8 @@ int main(int argc, char* argv[]) {
             telemetry_log_str = argv[++i];
         } else if (arg == "--dry-run") {
             force_dry_run = true;
+        } else if (arg == "--track-fills") {
+            force_track_fills = true;
         } else if (arg == "auth" || arg == "status" || arg == "execute") {
             mode = arg;
         }
@@ -204,6 +208,9 @@ int main(int argc, char* argv[]) {
         }
         if (force_dry_run) {
             exec_cfg.dry_run = true;
+        }
+        if (force_track_fills) {
+            exec_cfg.track_fills = true;
         }
 
         schwab::Config cfg = schwab::Config::load_from_file(config_path_str);

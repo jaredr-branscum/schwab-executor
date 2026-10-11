@@ -159,6 +159,112 @@ namespace {
 
 } // namespace
 
+std::string ExecutionRunner::format_reconciliation_table(
+    const BatchReconciliationReport& report,
+    std::span<const Quote> quotes
+) {
+    std::ostringstream ss;
+
+    ss << "\n================================================================================================================\n"
+       << "  [SCHWAB-EXECUTOR] POST-TRADE FILL & SLIPPAGE RECONCILIATION\n"
+       << "================================================================================================================\n"
+       << "  " << std::left
+       << std::setw(6)  << "SIDE"
+       << std::setw(10) << "SYMBOL"
+       << std::setw(12) << "ORDERED"
+       << std::setw(12) << "FILLED"
+       << std::setw(14) << "FILL ($)"
+       << std::setw(14) << "QUOTE ($)"
+       << std::setw(16) << "SLIPPAGE"
+       << std::setw(14) << "STATE"
+       << "ORDER ID\n"
+       << "  ----------------------------------------------------------------------------------------------------------------\n";
+
+    for (const auto& ord_res : report.orders) {
+        std::string side_str(to_string(ord_res.side));
+        std::string sym_str(ord_res.symbol.view());
+        std::string state_str(to_string(ord_res.final_state));
+        std::string id_str = ord_res.order_id.empty() ? "-" : ord_res.order_id;
+
+        std::ostringstream ord_qty_stream;
+        ord_qty_stream << std::fixed << std::setprecision(2) << ord_res.ordered_quantity;
+
+        std::ostringstream fill_qty_stream;
+        fill_qty_stream << std::fixed << std::setprecision(2) << ord_res.filled_quantity;
+
+        std::string fill_price_str = "-";
+        if (ord_res.average_fill_price > 0.0) {
+            std::ostringstream fps;
+            fps << "$" << std::fixed << std::setprecision(2) << ord_res.average_fill_price;
+            fill_price_str = fps.str();
+        }
+
+        std::string quote_price_str = "-";
+        double quote_val = 0.0;
+        if (ord_res.slippage.has_slippage) {
+            quote_val = ord_res.slippage.quote_price;
+        } else {
+            const Quote* q = find_quote(quotes, ord_res.symbol);
+            if (q != nullptr && q->is_valid()) {
+                quote_val = (ord_res.side == OrderSide::Buy) ? q->ask_price : q->bid_price;
+                if (quote_val <= 0.0) quote_val = q->reference_price();
+            }
+        }
+        if (quote_val > 0.0) {
+            std::ostringstream qps;
+            qps << "$" << std::fixed << std::setprecision(2) << quote_val;
+            quote_price_str = qps.str();
+        }
+
+        std::string slippage_str = "-";
+        if (ord_res.slippage.has_slippage) {
+            std::ostringstream sls;
+            if (ord_res.slippage.slippage_bps > 0.0) {
+                sls << "+";
+            }
+            sls << std::fixed << std::setprecision(1) << ord_res.slippage.slippage_bps << " bps";
+            slippage_str = sls.str();
+        } else if (ord_res.average_fill_price > 0.0 && quote_val > 0.0) {
+            auto s = calculate_slippage(ord_res.side, quote_val, ord_res.average_fill_price);
+            std::ostringstream sls;
+            if (s.slippage_bps > 0.0) {
+                sls << "+";
+            }
+            sls << std::fixed << std::setprecision(1) << s.slippage_bps << " bps";
+            slippage_str = sls.str();
+        }
+
+        ss << "  " << std::left
+           << std::setw(6)  << side_str
+           << std::setw(10) << sym_str
+           << std::setw(12) << ord_qty_stream.str()
+           << std::setw(12) << fill_qty_stream.str()
+           << std::setw(14) << fill_price_str
+           << std::setw(14) << quote_price_str
+           << std::setw(16) << slippage_str
+           << std::setw(14) << state_str
+           << id_str << "\n";
+    }
+
+    ss << "  ----------------------------------------------------------------------------------------------------------------\n"
+       << "  Total Tracked: " << report.total_tracked
+       << " | Filled: " << report.total_filled
+       << " | Cancelled: " << report.total_cancelled
+       << " | Rejected: " << report.total_rejected
+       << " | Timed Out: " << report.total_timed_out;
+
+    if (report.total_filled > 0) {
+        ss << " | Avg Slippage: ";
+        if (report.average_slippage_bps > 0.0) ss << "+";
+        ss << std::fixed << std::setprecision(1) << report.average_slippage_bps << " bps";
+    }
+
+    ss << " | Reconciliation Time: " << (report.elapsed_time.count() / 1000.0) << " ms\n"
+       << "================================================================================================================\n\n";
+
+    return ss.str();
+}
+
 int ExecutionRunner::execute(
     std::span<const Position> simulated_positions,
     std::optional<double> simulated_cash
@@ -180,6 +286,11 @@ int ExecutionRunner::execute(
     // Populate telemetry_log_path from config if not explicitly set
     if (!config_.telemetry_log_path.has_value() && cfg.has_param("SCHWAB_TELEMETRY_LOG_PATH")) {
         config_.telemetry_log_path = std::filesystem::path(cfg.get_string("SCHWAB_TELEMETRY_LOG_PATH"));
+    }
+
+    // Populate track_fills from config if not explicitly set
+    if (!config_.track_fills && cfg.has_param("SCHWAB_TRACK_FILLS")) {
+        config_.track_fills = cfg.get_bool("SCHWAB_TRACK_FILLS", false);
     }
 
     // Resolve Account Hash
@@ -440,6 +551,56 @@ int ExecutionRunner::execute(
         telemetry_callback_(report);
     }
 
+    std::string recon_table_str;
+    if (config_.track_fills && report.total_succeeded > 0) {
+        if (!config_.dry_run) {
+            std::cout << "  * Order Tracking     : Reconciling post-dispatch fills with Charles Schwab...\n";
+            OrderTrackerConfig tracker_cfg;
+            tracker_cfg.account_hash = account_hash;
+            tracker_cfg.polling_interval_ms = config_.fill_poll_interval_ms;
+            tracker_cfg.timeout_ms = config_.fill_poll_timeout_ms;
+
+            OrderTracker tracker(http_client_, tracker_cfg);
+            BatchReconciliationReport recon = tracker.reconcile_report(report, access_token, last_market_quotes_);
+
+            recon_table_str = format_reconciliation_table(recon, last_market_quotes_);
+            std::cout << recon_table_str;
+            last_reconciliation_report_ = recon;
+        } else {
+            // Simulated dry-run fill reconciliation
+            BatchReconciliationReport sim_recon;
+            sim_recon.orders.reserve(report.results.size());
+            for (const auto& res : report.results) {
+                OrderReconciliationResult r;
+                r.symbol = res.order.symbol;
+                r.side = res.order.side;
+                r.ordered_quantity = res.order.quantity;
+                r.filled_quantity = res.order.quantity;
+                r.order_id = res.order_id.value_or("DRY_RUN_SIMULATED");
+                r.final_state = OrderExecutionState::Filled;
+                r.is_terminal = true;
+                r.is_filled = true;
+                const Quote* q = find_quote(last_market_quotes_, r.symbol);
+                if (q != nullptr && q->is_valid()) {
+                    double ref = (r.side == OrderSide::Buy) ? q->ask_price : q->bid_price;
+                    if (ref <= 0.0) ref = q->reference_price();
+                    r.average_fill_price = ref;
+                    r.slippage = calculate_slippage(r.side, ref, ref);
+                } else {
+                    r.average_fill_price = res.order.limit_price.value_or(100.0);
+                }
+                sim_recon.orders.push_back(std::move(r));
+            }
+            sim_recon.total_tracked = sim_recon.orders.size();
+            sim_recon.total_filled = sim_recon.orders.size();
+            sim_recon.all_terminal = true;
+            sim_recon.all_filled = true;
+            recon_table_str = format_reconciliation_table(sim_recon, last_market_quotes_);
+            std::cout << recon_table_str;
+            last_reconciliation_report_ = sim_recon;
+        }
+    }
+
     if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
         std::error_code ec;
         if (config_.telemetry_log_path->has_parent_path()) {
@@ -457,6 +618,9 @@ int ExecutionRunner::execute(
             log_file << "[" << std::put_time(&gm_tm, "%Y-%m-%d %H:%M:%S UTC") << "] "
                      << "Mode: " << config_.session_name << " | Strategy: " << strategy_->name() << "\n"
                      << table_str << "\n";
+            if (!recon_table_str.empty()) {
+                log_file << recon_table_str << "\n";
+            }
         }
     }
 

@@ -3,6 +3,7 @@
 #include "schwab/http_client.hpp"
 #include "schwab/order_detail.hpp"
 #include "schwab/execution_driver.hpp"
+#include "schwab/market_data.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -42,6 +43,9 @@ struct OrderReconciliationResult {
     bool is_terminal{false};
     bool is_filled{false};
 
+    // Execution slippage metrics against pre-trade reference quote
+    SlippageMetric slippage{};
+
     std::string order_id{};
     std::string error_message{};
 };
@@ -56,6 +60,7 @@ struct BatchReconciliationReport {
     size_t total_cancelled{0};
     size_t total_rejected{0};
     size_t total_timed_out{0};
+    double average_slippage_bps{0.0};
     bool all_terminal{true};
     bool all_filled{true};
     std::chrono::microseconds elapsed_time{0};
@@ -115,7 +120,8 @@ public:
      */
     [[nodiscard]] BatchReconciliationReport reconcile_report(
         const ExecutionReport& report,
-        std::string_view access_token
+        std::string_view access_token,
+        std::span<const Quote> quotes = {}
     );
 
     /**
@@ -123,11 +129,13 @@ public:
      *
      * @param order_ids Collection of Schwab order IDs to reconcile.
      * @param access_token Active OAuth access token.
+     * @param quotes Optional pre-trade market quotes for slippage benchmarking.
      * @return BatchReconciliationReport detailing verified fills and terminal states.
      */
     [[nodiscard]] BatchReconciliationReport reconcile_orders(
         std::span<const std::string> order_ids,
-        std::string_view access_token
+        std::string_view access_token,
+        std::span<const Quote> quotes = {}
     );
 
     [[nodiscard]] const OrderTrackerConfig& config() const noexcept { return config_; }
@@ -144,7 +152,8 @@ private:
 
     static void compute_batch_summary(
         BatchReconciliationReport& report,
-        std::chrono::microseconds elapsed_time
+        std::chrono::microseconds elapsed_time,
+        std::span<const Quote> quotes = {}
     ) noexcept;
 
     HttpClient& http_client_;

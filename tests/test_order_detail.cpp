@@ -259,3 +259,56 @@ TEST_CASE("OrderDetailParser::parse_order_detail JSON parsing", "[order_detail]"
         CHECK_FALSE(OrderDetailParser::parse_order_detail("42").has_value());
     }
 }
+
+TEST_CASE("calculate_slippage execution slippage metrics", "[order_detail]") {
+    SECTION("Buy order slippage") {
+        // Adverse: Quote 100.0, Fill 100.20 -> +20.0 bps
+        auto s1 = calculate_slippage(OrderSide::Buy, 100.0, 100.20);
+        REQUIRE(s1.has_slippage);
+        CHECK_THAT(s1.quote_price, WithinAbs(100.0, 1e-9));
+        CHECK_THAT(s1.fill_price, WithinAbs(100.20, 1e-9));
+        CHECK_THAT(s1.price_diff, WithinAbs(0.20, 1e-9));
+        CHECK_THAT(s1.slippage_bps, WithinAbs(20.0, 1e-9));
+        CHECK_THAT(s1.abs_slippage_bps, WithinAbs(20.0, 1e-9));
+
+        // Favorable: Quote 100.0, Fill 99.85 -> -15.0 bps
+        auto s2 = calculate_slippage(OrderSide::Buy, 100.0, 99.85);
+        REQUIRE(s2.has_slippage);
+        CHECK_THAT(s2.price_diff, WithinAbs(-0.15, 1e-9));
+        CHECK_THAT(s2.slippage_bps, WithinAbs(-15.0, 1e-9));
+        CHECK_THAT(s2.abs_slippage_bps, WithinAbs(15.0, 1e-9));
+    }
+
+    SECTION("Sell order slippage") {
+        // Adverse: Quote 200.0, Fill 199.80 -> sold for less -> +10.0 bps
+        auto s1 = calculate_slippage(OrderSide::Sell, 200.0, 199.80);
+        REQUIRE(s1.has_slippage);
+        CHECK_THAT(s1.quote_price, WithinAbs(200.0, 1e-9));
+        CHECK_THAT(s1.fill_price, WithinAbs(199.80, 1e-9));
+        CHECK_THAT(s1.price_diff, WithinAbs(-0.20, 1e-9));
+        CHECK_THAT(s1.slippage_bps, WithinAbs(10.0, 1e-9));
+        CHECK_THAT(s1.abs_slippage_bps, WithinAbs(10.0, 1e-9));
+
+        // Favorable: Quote 200.0, Fill 200.40 -> sold for more -> -20.0 bps
+        auto s2 = calculate_slippage(OrderSide::Sell, 200.0, 200.40);
+        REQUIRE(s2.has_slippage);
+        CHECK_THAT(s2.price_diff, WithinAbs(0.40, 1e-9));
+        CHECK_THAT(s2.slippage_bps, WithinAbs(-20.0, 1e-9));
+        CHECK_THAT(s2.abs_slippage_bps, WithinAbs(20.0, 1e-9));
+    }
+
+    SECTION("Exact match has zero slippage") {
+        auto s = calculate_slippage(OrderSide::Buy, 50.0, 50.0);
+        REQUIRE(s.has_slippage);
+        CHECK_THAT(s.slippage_bps, WithinAbs(0.0, 1e-9));
+        CHECK_THAT(s.abs_slippage_bps, WithinAbs(0.0, 1e-9));
+    }
+
+    SECTION("Zero and invalid price bounds return has_slippage == false") {
+        CHECK_FALSE(calculate_slippage(OrderSide::Buy, 0.0, 100.0).has_slippage);
+        CHECK_FALSE(calculate_slippage(OrderSide::Buy, 100.0, 0.0).has_slippage);
+        CHECK_FALSE(calculate_slippage(OrderSide::Sell, -10.0, 100.0).has_slippage);
+        CHECK_FALSE(calculate_slippage(OrderSide::Sell, 100.0, -5.0).has_slippage);
+    }
+}
+

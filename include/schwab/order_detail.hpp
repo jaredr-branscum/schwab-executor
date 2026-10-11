@@ -58,6 +58,56 @@ enum class OrderExecutionState : uint8_t {
 }
 
 /**
+ * @brief Execution slippage metrics comparing executed fill price against reference quote price.
+ */
+struct SlippageMetric {
+    double quote_price{0.0};       ///< Pre-trade reference quote price at dispatch
+    double fill_price{0.0};        ///< Verified executed fill price (VWAP)
+    double price_diff{0.0};        ///< Raw price difference (fill_price - quote_price)
+    double slippage_bps{0.0};      ///< Directional slippage in bps (positive = adverse, negative = favorable)
+    double abs_slippage_bps{0.0};  ///< Absolute slippage in bps |fill_price - quote_price| / quote_price * 10,000
+    bool has_slippage{false};      ///< True if both quote_price > 0 and fill_price > 0
+};
+
+/**
+ * @brief Computes directional and absolute slippage in basis points.
+ *
+ * For Buy: fill_price > quote_price is adverse (+bps), fill_price < quote_price is favorable (-bps).
+ * For Sell: fill_price < quote_price is adverse (+bps), fill_price > quote_price is favorable (-bps).
+ *
+ * @param side OrderSide (Buy or Sell).
+ * @param quote_price Pre-trade reference quote price.
+ * @param fill_price Executed VWAP fill price.
+ * @return Calculated SlippageMetric.
+ */
+[[nodiscard]] constexpr SlippageMetric calculate_slippage(
+    OrderSide side,
+    double quote_price,
+    double fill_price
+) noexcept {
+    SlippageMetric m;
+    if (quote_price <= 0.0 || fill_price <= 0.0) {
+        return m;
+    }
+    m.quote_price = quote_price;
+    m.fill_price = fill_price;
+    m.price_diff = fill_price - quote_price;
+
+    const double raw_diff = (fill_price > quote_price) 
+        ? (fill_price - quote_price) 
+        : (quote_price - fill_price);
+    m.abs_slippage_bps = (raw_diff / quote_price) * 10000.0;
+
+    if (side == OrderSide::Buy) {
+        m.slippage_bps = ((fill_price - quote_price) / quote_price) * 10000.0;
+    } else {
+        m.slippage_bps = ((quote_price - fill_price) / quote_price) * 10000.0;
+    }
+    m.has_slippage = true;
+    return m;
+}
+
+/**
  * @brief Detailed execution record extracted from Schwab Order API.
  */
 struct OrderDetail {

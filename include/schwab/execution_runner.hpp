@@ -6,6 +6,7 @@
 #include "schwab/http_client.hpp"
 #include "schwab/market_data.hpp"
 #include "schwab/order.hpp"
+#include "schwab/order_tracker.hpp"
 #include "schwab/risk_guard.hpp"
 #include "schwab/strategy.hpp"
 #include "schwab/token_manager.hpp"
@@ -33,6 +34,9 @@ struct ExecutionConfig {
     std::string session_name{"LIVE"};             ///< Mode label for telemetry logging
     OrderType default_order_type{OrderType::Market};
     std::optional<std::filesystem::path> telemetry_log_path{std::nullopt}; ///< Optional path to append structured execution reports (live execution only)
+    bool track_fills{false};                        ///< If true, polls orders to terminal state post-dispatch (live only)
+    uint32_t fill_poll_interval_ms{100};            ///< Polling interval in ms for fill reconciliation
+    uint32_t fill_poll_timeout_ms{5000};            ///< Maximum timeout in ms for fill reconciliation
 };
 
 /**
@@ -65,6 +69,14 @@ public:
         bool is_dry_run
     );
 
+    /**
+     * @brief Formats post-trade fill verification and execution slippage as an ASCII table.
+     */
+    [[nodiscard]] static std::string format_reconciliation_table(
+        const BatchReconciliationReport& report,
+        std::span<const Quote> quotes = {}
+    );
+
     [[nodiscard]] const ExecutionConfig& config() const noexcept {
         return config_;
     }
@@ -87,6 +99,10 @@ public:
         return last_market_quotes_;
     }
 
+    [[nodiscard]] const std::optional<BatchReconciliationReport>& last_reconciliation_report() const noexcept {
+        return last_reconciliation_report_;
+    }
+
     [[nodiscard]] HttpClient& http_client() noexcept {
         return http_client_;
     }
@@ -98,6 +114,7 @@ private:
     TelemetryCallback telemetry_callback_{nullptr};
     std::vector<ExecutionReport> execution_history_{};
     std::vector<Quote> last_market_quotes_{};
+    std::optional<BatchReconciliationReport> last_reconciliation_report_{std::nullopt};
 };
 
 } // namespace schwab
