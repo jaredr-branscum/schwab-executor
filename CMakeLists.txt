@@ -52,6 +52,7 @@ add_library(schwab_core
     src/order_serializer.cpp
     src/rebalancer.cpp
     src/execution_driver.cpp
+    src/clock.cpp
 )
 
 target_include_directories(schwab_core PUBLIC

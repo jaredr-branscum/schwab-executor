@@ -13,6 +13,7 @@ add_executable(run_unit_tests
     test_order_serializer.cpp
     test_rebalancer.cpp
     test_execution_driver.cpp
+    test_clock.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 
