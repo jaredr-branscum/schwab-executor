@@ -373,6 +373,119 @@ TEST_CASE("ExecutionRunner real-time market data valuation and fallback", "[exec
         REQUIRE(code != 0); // Must reject order and return failure
     }
 
+    SECTION("Crossed order book in live execution triggers circuit breaker rejection") {
+        class CrossedBookStrategy : public IStrategy {
+        public:
+            [[nodiscard]] std::string_view name() const noexcept override { return "CrossedBookStrategy"; }
+            [[nodiscard]] std::vector<Order> generate_orders(std::span<const Position>, double) override {
+                Order ord;
+                ord.symbol = Symbol("SPY");
+                ord.side = OrderSide::Buy;
+                ord.quantity = 10.0;
+                ord.type = OrderType::Market;
+                return {ord};
+            }
+        };
+
+        ExecutionConfig cfg;
+        cfg.dry_run = false;
+        cfg.config_path = temp_env;
+        cfg.token_path = temp_token;
+        cfg.account_hash_override = "MOCK_ACCOUNT_HASH";
+
+        ExecutionRunner runner(cfg, std::make_shared<CrossedBookStrategy>());
+
+        auto transport = std::make_unique<MarketDataMockTransport>();
+        transport->quote_status = 200;
+        transport->quote_json = R"({
+            "SPY": {
+                "symbol": "SPY",
+                "quote": {
+                    "bidPrice": 580.00,
+                    "askPrice": 570.00,
+                    "lastPrice": 575.00,
+                    "mark": 575.00,
+                    "totalVolume": 1000000,
+                    "quoteTime": 1728676800000
+                }
+            }
+        })";
+
+        auto* transport_ptr = transport.get();
+        runner.http_client() = HttpClient(std::move(transport));
+
+        int code = runner.execute({}, 10'000.0);
+        REQUIRE(code != 0); // Must be rejected by crossed-book circuit breaker
+        REQUIRE(transport_ptr->orders_submitted == 0);
+    }
+
+    SECTION("Atomic abort in ExecutionRunner: sell failure aborts subsequent buy orders") {
+        class MultiOrderStrategy : public IStrategy {
+        public:
+            [[nodiscard]] std::string_view name() const noexcept override { return "MultiOrderStrategy"; }
+            [[nodiscard]] std::vector<Order> generate_orders(std::span<const Position>, double) override {
+                Order s;
+                s.symbol = Symbol("BAD");
+                s.side = OrderSide::Sell;
+                s.quantity = 10.0;
+                s.type = OrderType::Market;
+
+                Order b;
+                b.symbol = Symbol("SPY");
+                b.side = OrderSide::Buy;
+                b.quantity = 10.0;
+                b.type = OrderType::Market;
+
+                return {s, b};
+            }
+        };
+
+        ExecutionConfig cfg;
+        cfg.dry_run = false;
+        cfg.config_path = temp_env;
+        cfg.token_path = temp_token;
+        cfg.account_hash_override = "MOCK_ACCOUNT_HASH";
+
+        ExecutionRunner runner(cfg, std::make_shared<MultiOrderStrategy>());
+
+        auto transport = std::make_unique<MarketDataMockTransport>();
+        transport->quote_status = 200;
+        transport->quote_json = R"({
+            "BAD": {
+                "symbol": "BAD",
+                "quote": {
+                    "bidPrice": 105.00,
+                    "askPrice": 100.00,
+                    "lastPrice": 102.00,
+                    "mark": 102.00,
+                    "totalVolume": 1000,
+                    "quoteTime": 1728676800000
+                }
+            },
+            "SPY": {
+                "symbol": "SPY",
+                "quote": {
+                    "bidPrice": 574.90,
+                    "askPrice": 575.10,
+                    "lastPrice": 575.00,
+                    "mark": 575.05,
+                    "totalVolume": 50000000,
+                    "quoteTime": 1728676800000
+                }
+            }
+        })";
+
+        auto* transport_ptr = transport.get();
+        runner.http_client() = HttpClient(std::move(transport));
+
+        Position pos_bad{.quantity = 10.0, .average_price = 100.0, .current_price = 100.0, .symbol = Symbol("BAD")};
+        int code = runner.execute({&pos_bad, 1}, 10'000.0);
+
+        // BAD was rejected due to crossed book -> SPY buy was aborted -> zero orders approved
+        REQUIRE(code != 0);
+        REQUIRE(transport_ptr->orders_submitted == 0);
+    }
+
     std::filesystem::remove(temp_token, ec);
     std::filesystem::remove(temp_env, ec);
 }

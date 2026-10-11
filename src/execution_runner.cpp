@@ -90,6 +90,19 @@ namespace {
     return nullptr;
 }
 
+/// @brief Find real-time quote by symbol.
+[[nodiscard]] inline const Quote* find_quote(
+    std::span<const Quote> quotes,
+    Symbol symbol
+) noexcept {
+    for (const auto& q : quotes) {
+        if (q.symbol == symbol && q.is_valid()) {
+            return &q;
+        }
+    }
+    return nullptr;
+}
+
 /// @brief Resolves reference valuation price via priority:
 /// Live Quote -> Position Current -> Position Average -> Limit Price -> Fallback/Reject
 [[nodiscard]] inline double resolve_reference_price(
@@ -256,11 +269,14 @@ int ExecutionRunner::execute(
         return 0;
     }
 
-    // Pre-Trade RiskGuard Validation (Notional caps, collars, and MOC cutoff gate)
+    // Pre-Trade RiskGuard Validation (Notional caps, collars, spread breaker, MOC cutoff)
     RiskLimits limits;
     limits.max_order_notional = cfg.execution.max_order_notional;
+    limits.price_collar_percent = cfg.get_double("SCHWAB_PRICE_COLLAR_PERCENT", 0.05);
+    limits.max_bid_ask_spread_bps = cfg.get_double("SCHWAB_MAX_SPREAD_BPS", 50.0);
     limits.enforce_moc_cutoff = true;
     limits.dry_run = false; // Allow plan generation; ExecutionDriver handles dry-run simulation
+    limits.reject_crossed_book = true;
     RiskGuard risk_guard(limits);
 
     std::vector<Order> approved_orders;
@@ -278,7 +294,7 @@ int ExecutionRunner::execute(
 
     // Deferred diagnostics buffer to keep order validation and dispatch silent and zero-I/O
     std::vector<std::string> deferred_diagnostics;
-    deferred_diagnostics.reserve(raw_orders.size() + 2);
+    deferred_diagnostics.reserve(raw_orders.size() + 4);
 
     last_market_quotes_.clear();
     if (!symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
@@ -298,18 +314,81 @@ int ExecutionRunner::execute(
         }
     }
 
+    // Institutional Sequencing: Partition Sells first, Buys second
+    std::vector<Order> staged_sells;
+    std::vector<Order> staged_buys;
+    staged_sells.reserve(raw_orders.size());
+    staged_buys.reserve(raw_orders.size());
+
     for (const auto& ord : raw_orders) {
+        if (ord.side == OrderSide::Sell) {
+            staged_sells.push_back(ord);
+        } else {
+            staged_buys.push_back(ord);
+        }
+    }
+
+    bool has_rejected_sells = false;
+
+    // PASS 1: Validate and Stage Sells
+    for (const auto& ord : staged_sells) {
         const Position* pos = find_position(positions, ord.symbol);
         const double current_qty = pos ? pos->quantity : 0.0;
-        const double market_price = resolve_reference_price(
-            ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
-        );
+        const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
 
-        if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
-            continue; // Rejected at risk gate (unquoted and unpositioned)
+        RiskCheckResult check;
+        if (quote != nullptr) {
+            check = risk_guard.validate_order(ord, *quote, current_qty);
+        } else {
+            const double market_price = resolve_reference_price(
+                ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
+            );
+            if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
+                has_rejected_sells = true;
+                continue; // Rejected at risk gate (unquoted and unpositioned)
+            }
+            check = risk_guard.validate_order(ord, current_qty, market_price);
         }
 
-        auto check = risk_guard.validate_order(ord, current_qty, market_price);
+        if (check.approved) {
+            approved_orders.push_back(ord);
+        } else {
+            has_rejected_sells = true;
+            std::string msg = "  * [RISK WARNING] Order rejected for ";
+            msg.append(ord.symbol.view());
+            msg.append(": ");
+            msg.append(check.message);
+            deferred_diagnostics.push_back(std::move(msg));
+        }
+    }
+
+    // PASS 2: Validate and Stage Buys (Enforcing Atomic Abort if preceding Sells were blocked)
+    for (const auto& ord : staged_buys) {
+        if (has_rejected_sells) [[unlikely]] {
+            std::string msg = "  * [ATOMIC ABORT] Buy order aborted for ";
+            msg.append(ord.symbol.view());
+            msg.append(": preceding sell order was blocked by risk controls");
+            deferred_diagnostics.push_back(std::move(msg));
+            continue;
+        }
+
+        const Position* pos = find_position(positions, ord.symbol);
+        const double current_qty = pos ? pos->quantity : 0.0;
+        const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
+
+        RiskCheckResult check;
+        if (quote != nullptr) {
+            check = risk_guard.validate_order(ord, *quote, current_qty);
+        } else {
+            const double market_price = resolve_reference_price(
+                ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
+            );
+            if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
+                continue; // Rejected at risk gate (unquoted and unpositioned)
+            }
+            check = risk_guard.validate_order(ord, current_qty, market_price);
+        }
+
         if (check.approved) {
             approved_orders.push_back(ord);
         } else {
@@ -341,6 +420,7 @@ int ExecutionRunner::execute(
     driver_cfg.account_hash = account_hash;
     driver_cfg.dry_run = config_.dry_run;
     driver_cfg.stop_on_auth_failure = true;
+    driver_cfg.abort_buys_on_sell_failure = true;
 
     ExecutionDriver driver(http_client_, driver_cfg);
     ExecutionReport report = driver.execute_plan(plan, access_token);
