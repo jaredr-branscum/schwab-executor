@@ -238,3 +238,142 @@ TEST_CASE("ExecutionRunner execution flows", "[execution_runner]") {
         }
     }
 }
+
+TEST_CASE("ExecutionRunner real-time market data valuation and fallback", "[execution_runner]") {
+    auto temp_token = std::filesystem::temp_directory_path() / "test_exec_runner_md_token.json";
+    auto temp_env = std::filesystem::temp_directory_path() / "test_exec_runner_md.env";
+    std::error_code ec;
+    std::filesystem::remove(temp_token, ec);
+    std::filesystem::remove(temp_env, ec);
+
+    {
+        std::ofstream f(temp_env);
+        f << "SCHWAB_DRY_RUN=false\n";
+    }
+
+    {
+        std::ofstream f(temp_token);
+        auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        f << "{\n"
+          << "  \"access_token\": \"mock_market_token\",\n"
+          << "  \"refresh_token\": \"mock_refresh_token\",\n"
+          << "  \"token_type\": \"Bearer\",\n"
+          << "  \"expires_at\": " << (now_epoch + 3600) << ",\n"
+          << "  \"refresh_token_expires_at\": " << (now_epoch + 86400 * 7) << "\n"
+          << "}\n";
+    }
+
+    class MarketDataMockTransport : public ITransport {
+    public:
+        std::string quote_json;
+        int quote_status{200};
+        int orders_submitted{0};
+
+        bool prewarm() override { return true; }
+        [[nodiscard]] bool is_connected() const noexcept override { return true; }
+        [[nodiscard]] bool is_idle_expired() const noexcept override { return false; }
+        void disconnect() noexcept override {}
+
+        [[nodiscard]] HttpResponse send(const HttpRequest& req) override {
+            HttpResponse resp;
+            if (req.path.find("/marketdata/v1/quotes") != std::string_view::npos) {
+                resp.status_code = quote_status;
+                resp.body = quote_json;
+                resp.latency = std::chrono::microseconds{150};
+                return resp;
+            }
+            if (req.method == HttpMethod::Post) {
+                ++orders_submitted;
+                resp.status_code = 201;
+                resp.headers.push_back({"Location", "/trader/v1/accounts/MOCK/orders/999"});
+                resp.latency = std::chrono::microseconds{200};
+                return resp;
+            }
+            resp.status_code = 404;
+            return resp;
+        }
+    };
+
+    SECTION("Real-time quote successfully fetched and used for order valuation") {
+        std::vector<StrategyTargetWeight> targets = {
+            {Symbol("SPY"), 0.50}
+        };
+        auto strat = std::make_shared<SampleRebalanceStrategy>(targets);
+
+        ExecutionConfig cfg;
+        cfg.dry_run = false;
+        cfg.config_path = temp_env;
+        cfg.token_path = temp_token;
+        cfg.account_hash_override = "MOCK_ACCOUNT_HASH";
+
+        ExecutionRunner runner(cfg, strat);
+
+        auto transport = std::make_unique<MarketDataMockTransport>();
+        transport->quote_status = 200;
+        transport->quote_json = R"({
+            "SPY": {
+                "symbol": "SPY",
+                "quote": {
+                    "bidPrice": 574.90,
+                    "askPrice": 575.10,
+                    "lastPrice": 575.00,
+                    "mark": 575.05,
+                    "totalVolume": 50000000,
+                    "quoteTime": 1728676800000
+                }
+            }
+        })";
+
+        auto* transport_ptr = transport.get();
+        runner.http_client() = HttpClient(std::move(transport));
+
+        Position pos_spy{.quantity = 100.0, .average_price = 450.0, .current_price = 500.0, .symbol = Symbol("SPY")};
+        std::vector<Position> positions = {pos_spy};
+        double cash = 0.0;
+
+        int code = runner.execute(positions, cash);
+        REQUIRE(code == 0);
+        REQUIRE(transport_ptr->orders_submitted == 1);
+        REQUIRE(runner.last_market_quotes().size() == 1);
+        CHECK(runner.last_market_quotes()[0].symbol.view() == "SPY");
+        CHECK(runner.last_market_quotes()[0].mark_price == 575.05);
+    }
+
+    SECTION("Unquoted and unpositioned symbol in live execution is rejected by risk gate") {
+        class UnpositionedStrategy : public IStrategy {
+        public:
+            [[nodiscard]] std::string_view name() const noexcept override { return "UnpositionedStrategy"; }
+            [[nodiscard]] std::vector<Order> generate_orders(std::span<const Position>, double) override {
+                Order ord;
+                ord.symbol = Symbol("UNKNOWN");
+                ord.side = OrderSide::Buy;
+                ord.quantity = 10.0;
+                ord.type = OrderType::Market;
+                return {ord};
+            }
+        };
+
+        ExecutionConfig cfg;
+        cfg.dry_run = false;
+        cfg.config_path = temp_env;
+        cfg.token_path = temp_token;
+        cfg.account_hash_override = "MOCK_ACCOUNT_HASH";
+
+        ExecutionRunner runner(cfg, std::make_shared<UnpositionedStrategy>());
+
+        auto transport = std::make_unique<MarketDataMockTransport>();
+        transport->quote_status = 404; // Quote lookup fails
+        transport->quote_json = "{}";
+
+        runner.http_client() = HttpClient(std::move(transport));
+
+        // In live execution, with no quote and no position price, order cannot be valued safely
+        int code = runner.execute({}, 10'000.0);
+        REQUIRE(code != 0); // Must reject order and return failure
+    }
+
+    std::filesystem::remove(temp_token, ec);
+    std::filesystem::remove(temp_env, ec);
+}
+

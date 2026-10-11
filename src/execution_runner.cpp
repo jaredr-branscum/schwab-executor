@@ -75,6 +75,77 @@ std::string ExecutionRunner::format_telemetry_table(
     return ss.str();
 }
 
+namespace {
+
+/// @brief Find existing position by symbol.
+[[nodiscard]] inline const Position* find_position(
+    std::span<const Position> positions,
+    Symbol symbol
+) noexcept {
+    for (const auto& pos : positions) {
+        if (pos.symbol == symbol) {
+            return &pos;
+        }
+    }
+    return nullptr;
+}
+
+/// @brief Resolves reference valuation price via priority:
+/// Live Quote -> Position Current -> Position Average -> Limit Price -> Fallback/Reject
+[[nodiscard]] inline double resolve_reference_price(
+    const Order& ord,
+    std::span<const Quote> quotes,
+    const Position* pos,
+    bool is_dry_run,
+    std::vector<std::string>& diagnostics
+) {
+    // Live real-time market quote
+    for (const auto& q : quotes) {
+        if (q.symbol == ord.symbol && q.is_valid()) {
+            if (q.is_crossed()) [[unlikely]] {
+                std::string msg = "  * [MARKET WARNING] Crossed order book for ";
+                msg.append(ord.symbol.view());
+                msg.append(" (bid: $");
+                msg.append(std::to_string(q.bid_price));
+                msg.append(", ask: $");
+                msg.append(std::to_string(q.ask_price));
+                msg.append(")");
+                diagnostics.push_back(std::move(msg));
+            }
+            return q.reference_price();
+        }
+    }
+
+    // Portfolio position snapshot fallback
+    if (pos != nullptr) {
+        if (pos->current_price > 0.0) {
+            return pos->current_price;
+        }
+        if (pos->average_price > 0.0) {
+            return pos->average_price;
+        }
+    }
+
+    // Limit order explicit price bound
+    if (ord.type == OrderType::Limit && ord.limit_price.has_value() && *ord.limit_price > 0.0) {
+        return *ord.limit_price;
+    }
+
+    // Fallback safeguard
+    if (is_dry_run) [[unlikely]] {
+        return 1.0; // Controlled dry-run baseline
+    }
+
+    // Live unquoted & unpositioned symbol: cannot be safely valued
+    std::string msg = "  * [CRITICAL RISK] Cannot approve order for ";
+    msg.append(ord.symbol.view());
+    msg.append(": unquoted symbol with zero portfolio valuation.");
+    diagnostics.push_back(std::move(msg));
+    return 0.0;
+}
+
+} // namespace
+
 int ExecutionRunner::execute(
     std::span<const Position> simulated_positions,
     std::optional<double> simulated_cash
@@ -195,31 +266,65 @@ int ExecutionRunner::execute(
     std::vector<Order> approved_orders;
     approved_orders.reserve(raw_orders.size());
 
-    //TODO: must quote all symbols before approving orders
+    // Real-Time Market Data Valuation
+    std::vector<Symbol> symbols_to_quote;
+    symbols_to_quote.reserve(raw_orders.size());
     for (const auto& ord : raw_orders) {
-        double current_qty = 0.0;
-        double market_price = 100.0; // fallback if unquoted
+        if (!ord.symbol.is_valid()) continue;
+        if (std::find(symbols_to_quote.begin(), symbols_to_quote.end(), ord.symbol) == symbols_to_quote.end()) {
+            symbols_to_quote.push_back(ord.symbol);
+        }
+    }
 
-        for (const auto& pos : positions) {
-            if (pos.symbol == ord.symbol) {
-                current_qty = pos.quantity;
-                if (pos.current_price > 0.0) {
-                    market_price = pos.current_price;
-                }
-                break;
-            }
+    // Deferred diagnostics buffer to keep order validation and dispatch silent and zero-I/O
+    std::vector<std::string> deferred_diagnostics;
+    deferred_diagnostics.reserve(raw_orders.size() + 2);
+
+    last_market_quotes_.clear();
+    if (!symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
+        std::string quote_err;
+        last_market_quotes_ = MarketDataManager::fetch_quotes_batch(
+            http_client_,
+            symbols_to_quote,
+            access_token,
+            &quote_err
+        );
+        if (!last_market_quotes_.empty()) {
+            deferred_diagnostics.push_back("  * Market Data Quotes : Fetched " + 
+                std::to_string(last_market_quotes_.size()) + " real-time quote(s)");
+        } else if (!quote_err.empty()) {
+            deferred_diagnostics.push_back("  * Market Data Notice : Quote fetch notice: " + 
+                quote_err + " (falling back to portfolio position marks)");
+        }
+    }
+
+    for (const auto& ord : raw_orders) {
+        const Position* pos = find_position(positions, ord.symbol);
+        const double current_qty = pos ? pos->quantity : 0.0;
+        const double market_price = resolve_reference_price(
+            ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
+        );
+
+        if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
+            continue; // Rejected at risk gate (unquoted and unpositioned)
         }
 
         auto check = risk_guard.validate_order(ord, current_qty, market_price);
         if (check.approved) {
             approved_orders.push_back(ord);
         } else {
-            std::cout << "  * [RISK WARNING] Order rejected for " << ord.symbol.view() 
-                      << ": " << check.message << "\n";
+            std::string msg = "  * [RISK WARNING] Order rejected for ";
+            msg.append(ord.symbol.view());
+            msg.append(": ");
+            msg.append(check.message);
+            deferred_diagnostics.push_back(std::move(msg));
         }
     }
 
     if (approved_orders.empty()) {
+        for (const auto& diag : deferred_diagnostics) {
+            std::cerr << diag << "\n";
+        }
         std::cerr << "  * Error: All strategy orders were blocked by RiskGuard.\n\n";
         return 1;
     }
@@ -239,6 +344,11 @@ int ExecutionRunner::execute(
 
     ExecutionDriver driver(http_client_, driver_cfg);
     ExecutionReport report = driver.execute_plan(plan, access_token);
+
+    // Flush Deferred Diagnostics and Output Formatted Telemetry Table Post-Execution
+    for (const auto& diag : deferred_diagnostics) {
+        std::cout << diag << "\n";
+    }
 
     // Output Formatted Telemetry Table and Save to History/File
     std::string table_str = format_telemetry_table(report, config_.dry_run);

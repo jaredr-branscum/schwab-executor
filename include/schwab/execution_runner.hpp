@@ -4,6 +4,7 @@
 #include "schwab/config.hpp"
 #include "schwab/execution_driver.hpp"
 #include "schwab/http_client.hpp"
+#include "schwab/market_data.hpp"
 #include "schwab/order.hpp"
 #include "schwab/risk_guard.hpp"
 #include "schwab/strategy.hpp"
@@ -82,6 +83,10 @@ public:
         return execution_history_;
     }
 
+    [[nodiscard]] std::span<const Quote> last_market_quotes() const noexcept {
+        return last_market_quotes_;
+    }
+
     [[nodiscard]] HttpClient& http_client() noexcept {
         return http_client_;
     }
@@ -92,6 +97,7 @@ private:
     HttpClient http_client_{};
     TelemetryCallback telemetry_callback_{nullptr};
     std::vector<ExecutionReport> execution_history_{};
+    std::vector<Quote> last_market_quotes_{};
 };
 
 } // namespace schwab
