@@ -26,14 +26,14 @@ include(FetchContent)
 FetchContent_Declare(
     Catch2
     GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG        v3.5.2
+    GIT_TAG        v3.16.1
     GIT_SHALLOW    TRUE
 )
 # 2. nlohmann/json for JSON parsing
 FetchContent_Declare(
     nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
+    GIT_TAG        v3.12.0
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(Catch2 nlohmann_json)
