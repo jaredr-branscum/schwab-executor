@@ -92,6 +92,7 @@ struct FixedString {
 };
 
 using Symbol = FixedString<16>;
+using StrategyTag = FixedString<16>;
 
 /// @brief Trading order side (direction)
 enum class OrderSide : uint8_t {
@@ -195,6 +196,9 @@ struct Order {
 
     // Stack symbol buffer (16 bytes, fits any US equity ticker with zero heap allocation)
     Symbol symbol{};
+
+    // Strategy attribution tag (16 bytes, zero heap allocation)
+    StrategyTag tag{};
 
     /// @brief Validates structural sanity of the order (inlined on hot path)
     [[nodiscard]] inline bool is_valid() const noexcept {

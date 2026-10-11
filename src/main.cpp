@@ -1,6 +1,7 @@
 #include "schwab/token_manager.hpp"
 #include "schwab/process_runner.hpp"
 #include "schwab/time.hpp"
+#include "schwab/daemon.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -14,18 +15,25 @@ void print_help() noexcept {
               << "  Charles Schwab Low-Latency C++ Execution Engine (schwab-executor)\n"
               << "================================================================================\n"
               << "Usage:\n"
-              << "  schwab_executor --mode <mode> [options]\n"
-              << "  schwab_executor <command>\n\n"
-              << "Modes:\n"
-              << "  auth    Verify active OAuth session or launch interactive login\n"
-              << "  status  Inspect active session diagnostics and live Schwab account status\n"
-              << "  help    Display this help message\n\n"
+              << "  schwab_executor <command> [options]\n"
+              << "  schwab_executor --mode <command> [options]\n\n"
+              << "Commands:\n"
+              << "  auth     Verify active OAuth session or launch interactive login\n"
+              << "  status   Inspect active session diagnostics and live Schwab account status\n"
+              << "  execute  Evaluate strategy and execute rebalance orders immediately\n"
+              << "  daemon   Launch persistent trading daemon (monitors market schedule)\n"
+              << "  help     Display this help message\n\n"
               << "Options:\n"
-              << "  --token-path <path>  Path to .schwab_token.json (default: .schwab_token.json)\n"
-              << "  --help, -h           Display this help message\n\n"
+              << "  --dry-run              Force simulation mode (does not submit live broker orders)\n"
+              << "  --account-hash <hash>  Schwab encrypted account hash override\n"
+              << "  --config <path>        Path to .env configuration file (default: .env)\n"
+              << "  --token-path <path>    Path to .schwab_token.json (default: .schwab_token.json)\n"
+              << "  --telemetry-log <path> Path to append persistent execution logs\n"
+              << "  --help, -h             Display this help message\n\n"
               << "Examples:\n"
-              << "  schwab_executor --mode auth\n"
-              << "  schwab_executor --mode status\n"
+              << "  schwab_executor status\n"
+              << "  schwab_executor execute --dry-run\n"
+              << "  schwab_executor daemon --dry-run\n"
               << "================================================================================\n\n";
 }
 
@@ -103,7 +111,7 @@ int handle_status(const std::filesystem::path& token_path) {
             std::cerr << "  [WARN] Account query returned code " << res.exit_code << ": " << res.output << "\n";
         }
     } else {
-        std::cout << "\n  * (Local python/status_cli.py not configured - C++ engine ready for native HTTP)\n";
+        std::cout << "\n  * (Local python/status_cli.py not configured)\n";
     }
 
     std::cout << "================================================================================\n\n";
@@ -119,6 +127,10 @@ int main(int argc, char* argv[]) {
 
     std::string_view mode = "status";
     std::string_view token_path_str = ".schwab_token.json";
+    std::string_view config_path_str = ".env";
+    std::string_view account_hash_str = "";
+    std::string_view telemetry_log_str = "";
+    bool force_dry_run = false;
 
     // Zero-allocation CLI argument parsing using string_view slices
     for (int i = 1; i < argc; ++i) {
@@ -130,7 +142,15 @@ int main(int argc, char* argv[]) {
             mode = argv[++i];
         } else if (arg == "--token-path" && i + 1 < argc) {
             token_path_str = argv[++i];
-        } else if (arg == "auth" || arg == "status") {
+        } else if (arg == "--config" && i + 1 < argc) {
+            config_path_str = argv[++i];
+        } else if (arg == "--account-hash" && i + 1 < argc) {
+            account_hash_str = argv[++i];
+        } else if ((arg == "--telemetry-log" || arg == "--log") && i + 1 < argc) {
+            telemetry_log_str = argv[++i];
+        } else if (arg == "--dry-run") {
+            force_dry_run = true;
+        } else if (arg == "auth" || arg == "status" || arg == "execute" || arg == "daemon") {
             mode = arg;
         }
     }
@@ -141,6 +161,36 @@ int main(int argc, char* argv[]) {
         return handle_auth(token_path);
     } else if (mode == "status") {
         return handle_status(token_path);
+    } else if (mode == "execute") {
+        schwab::DaemonConfig dcfg;
+        dcfg.session_name = "EXECUTE";
+        dcfg.config_path = config_path_str;
+        dcfg.token_path = token_path;
+        dcfg.account_hash_override = std::string(account_hash_str);
+        if (!telemetry_log_str.empty()) {
+            dcfg.telemetry_log_path = std::filesystem::path(telemetry_log_str);
+        }
+        if (force_dry_run) {
+            dcfg.dry_run = true;
+        }
+
+        schwab::DaemonRunner runner(std::move(dcfg));
+        return runner.run_immediate();
+    } else if (mode == "daemon") {
+        schwab::DaemonConfig dcfg;
+        dcfg.session_name = "DAEMON";
+        dcfg.config_path = config_path_str;
+        dcfg.token_path = token_path;
+        dcfg.account_hash_override = std::string(account_hash_str);
+        if (!telemetry_log_str.empty()) {
+            dcfg.telemetry_log_path = std::filesystem::path(telemetry_log_str);
+        }
+        if (force_dry_run) {
+            dcfg.dry_run = true;
+        }
+
+        schwab::DaemonRunner runner(std::move(dcfg));
+        return runner.run_daemon();
     } else {
         std::cerr << "[ERROR] Unknown mode: '" << mode << "'. Use --help for usage.\n";
         return 1;

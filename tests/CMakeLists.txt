@@ -14,6 +14,9 @@ add_executable(run_unit_tests
     test_rebalancer.cpp
     test_execution_driver.cpp
     test_clock.cpp
+    test_strategy.cpp
+    test_account_manager.cpp
+    test_daemon.cpp
 )
 
 target_link_libraries(run_unit_tests PRIVATE 

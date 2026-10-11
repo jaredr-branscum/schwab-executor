@@ -53,6 +53,9 @@ add_library(schwab_core
     src/rebalancer.cpp
     src/execution_driver.cpp
     src/clock.cpp
+    src/strategy.cpp
+    src/account_manager.cpp
+    src/daemon.cpp
 )
 
 target_include_directories(schwab_core PUBLIC
