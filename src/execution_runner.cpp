@@ -407,10 +407,10 @@ int ExecutionRunner::execute(
         std::vector<AccountPortfolio> input_accs(simulated_accounts.begin(), simulated_accounts.end());
         target_accounts = AccountManager::filter_accounts(input_accs, active_filter);
         if (target_accounts.empty()) {
-            std::cerr << "  * [ERROR] Zero simulated accounts matched filter '" << active_filter << "'.\n\n";
+            std::cerr << "  * [ERROR] Zero " << (config_.dry_run ? "simulated" : "pre-loaded") << " accounts matched filter '" << active_filter << "'.\n\n";
             return 1;
         }
-        std::cout << "  * Portfolio Context  : Simulated batch (" << target_accounts.size() << " account(s))\n";
+        std::cout << "  * Portfolio Context  : " << (config_.dry_run ? "Simulated batch (" : "Pre-loaded batch (") << target_accounts.size() << " account(s))\n";
     } else if (!simulated_positions.empty() || simulated_cash.has_value()) {
         AccountPortfolio mock_acc;
         mock_acc.account_number = "SIMULATED";
