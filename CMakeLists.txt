@@ -16,8 +16,10 @@ endif()
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# Enable testing
-enable_testing()
+# Enable testing (if root project)
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    enable_testing()
+endif()
 
 # Third-party dependencies via FetchContent
 include(FetchContent)
@@ -73,14 +75,15 @@ if(WIN32)
     target_link_libraries(schwab_core PUBLIC winhttp)
 endif()
 
-# Main CLI executable
-add_executable(schwab_executor
-    src/main.cpp
-)
+# Main CLI executable and test suites (only built when schwab-executor is the root project)
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    add_executable(schwab_executor
+        src/main.cpp
+    )
 
-target_link_libraries(schwab_executor PRIVATE
-    schwab_core
-)
+    target_link_libraries(schwab_executor PRIVATE
+        schwab_core
+    )
 
-# Subdirectories
-add_subdirectory(tests)
+    add_subdirectory(tests)
+endif()
