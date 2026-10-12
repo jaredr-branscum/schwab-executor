@@ -13,9 +13,21 @@ SampleRebalanceStrategy::SampleRebalanceStrategy(
 ) noexcept
     : targets_(std::move(targets)), order_type_(order_type) {}
 
+std::vector<Symbol> SampleRebalanceStrategy::target_symbols() const {
+    std::vector<Symbol> syms;
+    syms.reserve(targets_.size());
+    for (const auto& tgt : targets_) {
+        if (tgt.is_valid()) {
+            syms.push_back(tgt.symbol);
+        }
+    }
+    return syms;
+}
+
 std::vector<Order> SampleRebalanceStrategy::generate_orders(
     std::span<const Position> positions,
-    double available_cash
+    double available_cash,
+    std::span<const Quote> quotes
 ) {
     if (targets_.empty()) {
         return {};
@@ -23,11 +35,35 @@ std::vector<Order> SampleRebalanceStrategy::generate_orders(
 
     const OrderType ord_type = order_type_;
 
+    // Pricing lookup prioritizing quotes then positions
+    auto get_price = [&](const Symbol& sym) noexcept -> double {
+        for (const auto& q : quotes) {
+            if (q.symbol == sym && q.is_valid()) {
+                double ref = q.reference_price();
+                if (ref > 0.0) {
+                    return ref;
+                }
+            }
+        }
+        for (const auto& pos : positions) {
+            if (pos.symbol == sym && pos.current_price > 0.0) {
+                return pos.current_price;
+            }
+        }
+        return 0.0;
+    };
+
     // Calculate Total Portfolio Market Value
     double total_value = (available_cash > 0.0) ? available_cash : 0.0;
     for (const auto& pos : positions) {
-        if (pos.quantity > 0.0 && pos.current_price > 0.0) {
-            total_value += pos.quantity * pos.current_price;
+        if (pos.quantity > 0.0) {
+            double p = get_price(pos.symbol);
+            if (p <= 0.0) {
+                p = (pos.current_price > 0.0) ? pos.current_price : 0.0;
+            }
+            if (p > 0.0) {
+                total_value += pos.quantity * p;
+            }
         }
     }
 
@@ -71,15 +107,14 @@ std::vector<Order> SampleRebalanceStrategy::generate_orders(
         }
 
         double cur_qty = 0.0;
-        double cur_price = 0.0;
         for (const auto& pos : positions) {
             if (pos.symbol == tgt.symbol) {
                 cur_qty = pos.quantity;
-                cur_price = pos.current_price;
                 break;
             }
         }
 
+        double cur_price = get_price(tgt.symbol);
         if (cur_price <= 0.0) {
             continue;
         }
@@ -107,15 +142,14 @@ std::vector<Order> SampleRebalanceStrategy::generate_orders(
         }
 
         double cur_qty = 0.0;
-        double cur_price = 0.0;
         for (const auto& pos : positions) {
             if (pos.symbol == tgt.symbol) {
                 cur_qty = pos.quantity;
-                cur_price = pos.current_price;
                 break;
             }
         }
 
+        double cur_price = get_price(tgt.symbol);
         if (cur_price <= 0.0) {
             continue;
         }
@@ -193,16 +227,27 @@ std::vector<StrategyTargetWeight> SampleRebalanceStrategy::parse_targets(std::st
     return targets;
 }
 
+std::vector<Symbol> CompositeStrategy::target_symbols() const {
+    std::vector<Symbol> syms;
+    for (const auto& strat : strategies_) {
+        if (!strat) continue;
+        auto sub_syms = strat->target_symbols();
+        syms.insert(syms.end(), sub_syms.begin(), sub_syms.end());
+    }
+    return syms;
+}
+
 std::vector<Order> CompositeStrategy::generate_orders(
     std::span<const Position> positions,
-    double available_cash
+    double available_cash,
+    std::span<const Quote> quotes
 ) {
     std::vector<Order> combined;
     for (const auto& strat : strategies_) {
         if (!strat) {
             continue;
         }
-        auto sub_orders = strat->generate_orders(positions, available_cash);
+        auto sub_orders = strat->generate_orders(positions, available_cash, quotes);
         for (auto& ord : sub_orders) {
             if (ord.tag.empty()) {
                 ord.tag = StrategyTag(strat->name());

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "schwab/market_data.hpp"
 #include "schwab/order.hpp"
 
 #include <cmath>
@@ -26,6 +27,13 @@ public:
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
     /**
+     * @brief Target symbols required by the strategy for quote resolution and pricing.
+     */
+    [[nodiscard]] virtual std::vector<Symbol> target_symbols() const {
+        return {};
+    }
+
+    /**
      * @brief Evaluates portfolio state and generates target trading orders.
      *
      * @param positions Current portfolio positions held in the account.
@@ -35,7 +43,25 @@ public:
     [[nodiscard]] virtual std::vector<Order> generate_orders(
         std::span<const Position> positions,
         double available_cash
-    ) = 0;
+    ) {
+        (void)positions;
+        (void)available_cash;
+        return {};
+    }
+
+    /**
+     * @brief Evaluates portfolio state with real-time market quotes.
+     *
+     * Enables strategies to accurately price unheld target assets (e.g. all-cash rebalances).
+     */
+    [[nodiscard]] virtual std::vector<Order> generate_orders(
+        std::span<const Position> positions,
+        double available_cash,
+        std::span<const Quote> quotes
+    ) {
+        (void)quotes;
+        return generate_orders(positions, available_cash);
+    }
 };
 
 /**
@@ -66,9 +92,19 @@ public:
         return "SampleRebalanceStrategy";
     }
 
+    [[nodiscard]] std::vector<Symbol> target_symbols() const override;
+
     [[nodiscard]] std::vector<Order> generate_orders(
         std::span<const Position> positions,
         double available_cash
+    ) override {
+        return generate_orders(positions, available_cash, {});
+    }
+
+    [[nodiscard]] std::vector<Order> generate_orders(
+        std::span<const Position> positions,
+        double available_cash,
+        std::span<const Quote> quotes
     ) override;
 
     [[nodiscard]] const std::vector<StrategyTargetWeight>& targets() const noexcept {
@@ -110,9 +146,19 @@ public:
         return name_;
     }
 
+    [[nodiscard]] std::vector<Symbol> target_symbols() const override;
+
     [[nodiscard]] std::vector<Order> generate_orders(
         std::span<const Position> positions,
         double available_cash
+    ) override {
+        return generate_orders(positions, available_cash, {});
+    }
+
+    [[nodiscard]] std::vector<Order> generate_orders(
+        std::span<const Position> positions,
+        double available_cash,
+        std::span<const Quote> quotes
     ) override;
 
     [[nodiscard]] const std::vector<std::shared_ptr<IStrategy>>& strategies() const noexcept {

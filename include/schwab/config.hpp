@@ -36,7 +36,7 @@ struct Config {
     std::string app_secret;                                  ///< Charles Schwab App Secret
     std::string callback_url{"https://127.0.0.1"};           ///< Registered OAuth redirect URL
     std::string base_url{"https://api.schwabapi.com"};       ///< Schwab API base URL
-    std::string target_account_number;                       ///< Target Schwab account encrypted hash (required for live execution; optional for auth, status, and dry-run; can be passed via --account-hash)
+    std::string accounts{"all"};                             ///< Target Schwab account(s) filter: "all", comma-separated numbers/hashes (configured via SCHWAB_ACCOUNTS)
     std::filesystem::path token_path{".schwab_token.json"};  ///< Path to cached OAuth tokens
 
     // Dynamic User-Configurable Strategy Parameters

@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include "schwab/strategy.hpp"
 
 using namespace schwab;
@@ -40,15 +41,39 @@ TEST_CASE("SampleRebalanceStrategy order generation", "[strategy]") {
     SampleRebalanceStrategy strat(targets);
     REQUIRE(strat.name() == "SampleRebalanceStrategy");
 
-    SECTION("Empty portfolio with cash generates only Buy orders") {
+    SECTION("Empty portfolio with cash without quotes skips targets") {
         std::vector<Position> positions = {};
         double cash = 100'000.0; // $100k cash
 
-        // For testing prices: we need current prices to compute share counts
-        // If positions are empty, current_price is unknown unless provided.
-        // With no positions, strategy skips targets without prices
         auto orders = strat.generate_orders(positions, cash);
         REQUIRE(orders.empty());
+    }
+
+    SECTION("Empty portfolio with cash and real-time quotes generates target Buy orders") {
+        std::vector<Position> positions = {};
+        double cash = 100'000.0; // $100k cash
+
+        Quote q_spy;
+        q_spy.symbol = Symbol("SPY");
+        q_spy.mark_price = 500.0;
+        q_spy.last_price = 500.0;
+
+        Quote q_qqq;
+        q_qqq.symbol = Symbol("QQQ");
+        q_qqq.mark_price = 400.0;
+        q_qqq.last_price = 400.0;
+
+        std::vector<Quote> quotes = {q_spy, q_qqq};
+        auto orders = strat.generate_orders(positions, cash, quotes);
+
+        REQUIRE(orders.size() == 2);
+        CHECK(orders[0].symbol == "SPY");
+        CHECK(orders[0].side == OrderSide::Buy);
+        CHECK(orders[0].quantity == Catch::Approx(120.0));
+
+        CHECK(orders[1].symbol == "QQQ");
+        CHECK(orders[1].side == OrderSide::Buy);
+        CHECK(orders[1].quantity == Catch::Approx(100.0));
     }
 
     SECTION("Rebalance with existing positions and prices") {

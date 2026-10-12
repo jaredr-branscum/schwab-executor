@@ -92,10 +92,7 @@ def main() -> int:
             total_liq += liq_val
             total_cash += cash_bal
 
-            h_val = hash_map.get(acc_num, "")
             print(f"    - Account {idx} [{masked_num} - {acc_type}]: Liquidation Value = ${liq_val:,.2f} | Cash = ${cash_bal:,.2f}")
-            if h_val:
-                print(f"      Hash (for .env)     : {h_val}")
 
         if len(data) > 1:
             print(f"  * Total Portfolio Equity: ${total_liq:,.2f}")

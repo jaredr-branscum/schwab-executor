@@ -28,6 +28,7 @@ void print_help() noexcept {
               << "Options:\n"
               << "  --dry-run              Force simulation mode (does not submit live broker orders)\n"
               << "  --preview              Validate orders against live Schwab margin/order engine (/previewOrder) without executing\n"
+              << "  --accounts <filter>    Account filter: \"all\", comma-separated numbers/hashes (default: SCHWAB_ACCOUNTS in .env)\n"
               << "  --account-hash <hash>  Schwab encrypted account hash override\n"
               << "  --config <path>        Path to .env configuration file (default: .env)\n"
               << "  --token-path <path>    Path to .schwab_token.json (default: .schwab_token.json)\n"
@@ -37,7 +38,8 @@ void print_help() noexcept {
               << "Examples:\n"
               << "  schwab_executor status\n"
               << "  schwab_executor execute --dry-run\n"
-              << "  schwab_executor execute --preview\n"
+              << "  schwab_executor execute --preview --accounts all\n"
+              << "  schwab_executor execute --accounts all\n"
               << "  schwab_executor execute\n"
               << "================================================================================\n\n";
 }
@@ -159,6 +161,7 @@ int main(int argc, char* argv[]) {
     std::string_view token_path_str = ".schwab_token.json";
     std::string_view config_path_str = ".env";
     std::string_view account_hash_str = "";
+    std::string_view accounts_filter_str = "";
     std::string_view telemetry_log_str = "";
     bool force_dry_run = false;
     bool force_preview = false;
@@ -176,6 +179,8 @@ int main(int argc, char* argv[]) {
             token_path_str = argv[++i];
         } else if (arg == "--config" && i + 1 < argc) {
             config_path_str = argv[++i];
+        } else if (arg == "--accounts" && i + 1 < argc) {
+            accounts_filter_str = argv[++i];
         } else if (arg == "--account-hash" && i + 1 < argc) {
             account_hash_str = argv[++i];
         } else if ((arg == "--telemetry-log" || arg == "--log") && i + 1 < argc) {
@@ -208,6 +213,9 @@ int main(int argc, char* argv[]) {
         exec_cfg.config_path = config_path_str;
         exec_cfg.token_path = token_path;
         exec_cfg.account_hash_override = std::string(account_hash_str);
+        if (!accounts_filter_str.empty()) {
+            exec_cfg.accounts_filter = std::string(accounts_filter_str);
+        }
         if (!telemetry_log_str.empty()) {
             exec_cfg.telemetry_log_path = std::filesystem::path(telemetry_log_str);
         }

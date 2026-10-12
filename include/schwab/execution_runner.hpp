@@ -32,12 +32,46 @@ struct ExecutionConfig {
     std::filesystem::path config_path{".env"};
     std::filesystem::path token_path{".schwab_token.json"};
     std::string account_hash_override{};
+    std::string accounts_filter{};                  ///< Filter for accounts: "all", comma-separated numbers/hashes (defaults to SCHWAB_ACCOUNTS in .env)
     std::string session_name{"LIVE"};             ///< Mode label for telemetry logging
     OrderType default_order_type{OrderType::Market};
     std::optional<std::filesystem::path> telemetry_log_path{std::nullopt}; ///< Optional path to append structured execution reports (live execution only)
     bool track_fills{false};                        ///< If true, polls orders to terminal state post-dispatch (live only)
     uint32_t fill_poll_interval_ms{100};            ///< Polling interval in ms for fill reconciliation
     uint32_t fill_poll_timeout_ms{5000};            ///< Maximum timeout in ms for fill reconciliation
+};
+
+/**
+ * @brief Telemetry metrics for single account execution in a batch session.
+ */
+struct AccountSessionResult {
+    std::string account_number{};
+    std::string masked_account_number{};
+    std::string account_hash{};
+    std::string account_type{};
+    double cash_balance{0.0};
+    double liquidation_value{0.0};
+    size_t positions_count{0};
+    size_t orders_generated{0};
+    size_t orders_succeeded{0};
+    size_t orders_failed{0};
+    bool success{true};
+    std::string status_notes{};
+    std::chrono::microseconds execution_time{0};
+};
+
+/**
+ * @brief Multi-account batch execution session aggregate summary.
+ */
+struct BatchSessionSummary {
+    std::vector<AccountSessionResult> account_results{};
+    size_t total_accounts{0};
+    size_t succeeded_accounts{0};
+    size_t failed_accounts{0};
+    size_t total_orders_submitted{0};
+    size_t total_orders_succeeded{0};
+    size_t total_orders_failed{0};
+    std::chrono::microseconds total_session_time{0};
 };
 
 /**
@@ -55,11 +89,13 @@ public:
      *
      * @param simulated_positions Optional mock positions for offline dry-run testing.
      * @param simulated_cash Optional mock cash for offline dry-run testing.
+     * @param simulated_accounts Optional mock multi-account portfolios for offline batch testing.
      * @return Process exit code (0 on success, non-zero on error).
      */
     int execute(
         std::span<const Position> simulated_positions = {},
-        std::optional<double> simulated_cash = std::nullopt
+        std::optional<double> simulated_cash = std::nullopt,
+        std::span<const AccountPortfolio> simulated_accounts = {}
     );
 
     /**
@@ -77,6 +113,13 @@ public:
     [[nodiscard]] static std::string format_reconciliation_table(
         const BatchReconciliationReport& report,
         std::span<const Quote> quotes = {}
+    );
+
+    /**
+     * @brief Formats an aggregate multi-account batch session summary as an ASCII table.
+     */
+    [[nodiscard]] static std::string format_batch_summary_table(
+        const BatchSessionSummary& summary
     );
 
     [[nodiscard]] const ExecutionConfig& config() const noexcept {
@@ -105,6 +148,10 @@ public:
         return last_reconciliation_report_;
     }
 
+    [[nodiscard]] const std::optional<BatchSessionSummary>& last_batch_summary() const noexcept {
+        return last_batch_summary_;
+    }
+
     [[nodiscard]] HttpClient& http_client() noexcept {
         return http_client_;
     }
@@ -117,6 +164,7 @@ private:
     std::vector<ExecutionReport> execution_history_{};
     std::vector<Quote> last_market_quotes_{};
     std::optional<BatchReconciliationReport> last_reconciliation_report_{std::nullopt};
+    std::optional<BatchSessionSummary> last_batch_summary_{std::nullopt};
 };
 
 } // namespace schwab

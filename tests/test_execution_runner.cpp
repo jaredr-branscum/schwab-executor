@@ -9,7 +9,7 @@
 using namespace schwab;
 
 TEST_CASE("ExecutionConfig initialization defaults and overrides", "[execution_runner]") {
-    SECTION("Default configuration has institutional safety defaults") {
+    SECTION("Default configuration has safety defaults") {
         ExecutionConfig cfg;
         REQUIRE(cfg.dry_run);
         REQUIRE(cfg.config_path == ".env");
@@ -573,6 +573,127 @@ TEST_CASE("ExecutionRunner dry-run post-dispatch fill reconciliation", "[executi
     CHECK(last_recon->orders[0].symbol.view() == "SPY");
     CHECK(last_recon->orders[0].side == OrderSide::Sell);
     CHECK(last_recon->orders[0].is_filled);
+}
+
+TEST_CASE("ExecutionRunner multi-account batch execution (SCHWAB_ACCOUNTS=all)", "[execution_runner]") {
+    std::vector<StrategyTargetWeight> targets = {
+        {Symbol("SPY"), 0.50}
+    };
+    auto strat = std::make_shared<SampleRebalanceStrategy>(targets);
+
+    AccountPortfolio acc1;
+    acc1.account_number = "11112222";
+    acc1.account_hash = "MOCK_HASH_ALPHA_11112222_000011112222333344445555666677778888999900001111";
+    acc1.account_type = "INDIVIDUAL";
+    acc1.cash_balance = 0.0;
+    acc1.available_funds = 0.0;
+    acc1.liquidation_value = 50000.0;
+    acc1.positions.push_back(Position{
+        .quantity = 100.0,
+        .average_price = 450.0,
+        .current_price = 500.0,
+        .symbol = Symbol("SPY")
+    });
+
+    AccountPortfolio acc2;
+    acc2.account_number = "33334444";
+    acc2.account_hash = "MOCK_HASH_BETA_33334444_AAAA9999888877776666555544443333222211110000FFFF";
+    acc2.account_type = "INDIVIDUAL";
+    acc2.cash_balance = 0.0;
+    acc2.available_funds = 0.0;
+    acc2.liquidation_value = 0.0;
+
+    std::vector<AccountPortfolio> accounts = {acc1, acc2};
+
+    SECTION("Batch execution across multiple accounts evaluates each independently") {
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.accounts_filter = "all";
+
+        ExecutionRunner runner(cfg, strat);
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        REQUIRE(exit_code == 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->total_accounts == 2);
+        CHECK(summary->succeeded_accounts == 2);
+        CHECK(summary->failed_accounts == 0);
+        CHECK(summary->total_orders_submitted == 1);
+        CHECK(summary->total_orders_succeeded == 1);
+
+        // Account 1 had 1 rebalance sell order
+        REQUIRE(summary->account_results.size() == 2);
+        CHECK(summary->account_results[0].account_number == "11112222");
+        CHECK(summary->account_results[0].masked_account_number == "***2222");
+        CHECK(summary->account_results[0].orders_generated == 1);
+        CHECK(summary->account_results[0].orders_succeeded == 1);
+        CHECK(summary->account_results[0].success);
+
+        // Account 2 had 0 positions and 0 cash -> zero orders needed -> succeeded
+        CHECK(summary->account_results[1].account_number == "33334444");
+        CHECK(summary->account_results[1].masked_account_number == "***4444");
+        CHECK(summary->account_results[1].orders_generated == 0);
+        CHECK(summary->account_results[1].success);
+
+        // Verify batch summary table formatting
+        std::string table = ExecutionRunner::format_batch_summary_table(*summary);
+        REQUIRE_FALSE(table.empty());
+        CHECK(table.find("MULTI-ACCOUNT BATCH EXECUTION SUMMARY (2 Accounts)") != std::string::npos);
+        CHECK(table.find("***2222") != std::string::npos);
+        CHECK(table.find("***4444") != std::string::npos);
+        CHECK(table.find("Total Accounts: 2") != std::string::npos);
+        CHECK(table.find("Succeeded: 2") != std::string::npos);
+    }
+
+    SECTION("Account filter selects specific account from batch") {
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.accounts_filter = "4444"; // only second account
+
+        ExecutionRunner runner(cfg, strat);
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        REQUIRE(exit_code == 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->total_accounts == 1);
+        CHECK(summary->account_results[0].account_number == "33334444");
+    }
+
+    SECTION("Risk rejection on one account records failure in batch summary") {
+        class RejectStrategy : public IStrategy {
+        public:
+            [[nodiscard]] std::string_view name() const noexcept override { return "RejectStrategy"; }
+            [[nodiscard]] std::vector<Order> generate_orders(std::span<const Position> positions, double) override {
+                if (positions.empty()) return {};
+                // Order exceeding notional limits
+                Order o;
+                o.symbol = Symbol("SPY");
+                o.side = OrderSide::Sell;
+                o.quantity = 1000000.0; // massive quantity -> blocked by RiskGuard max_order_notional
+                o.type = OrderType::Market;
+                return {o};
+            }
+        };
+
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.accounts_filter = "all";
+
+        ExecutionRunner runner(cfg, std::make_shared<RejectStrategy>());
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        // Acc1 blocked by RiskGuard -> overall exit code non-zero
+        REQUIRE(exit_code != 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->total_accounts == 2);
+        CHECK(summary->succeeded_accounts == 1);
+        CHECK(summary->failed_accounts == 1);
+        CHECK_FALSE(summary->account_results[0].success);
+        CHECK(summary->account_results[1].success);
+    }
 }
 
 

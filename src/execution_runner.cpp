@@ -270,9 +270,62 @@ std::string ExecutionRunner::format_reconciliation_table(
     return ss.str();
 }
 
+std::string ExecutionRunner::format_batch_summary_table(
+    const BatchSessionSummary& summary
+) {
+    std::ostringstream ss;
+    ss << "\n================================================================================================================\n"
+       << "  [SCHWAB-EXECUTOR] MULTI-ACCOUNT BATCH EXECUTION SUMMARY (" << summary.total_accounts << " Accounts)\n"
+       << "================================================================================================================\n"
+       << "  " << std::left
+       << std::setw(12) << "ACCOUNT"
+       << std::setw(14) << "TYPE"
+       << std::setw(16) << "EQUITY ($)"
+       << std::setw(16) << "CASH ($)"
+       << std::setw(10) << "ORDERS"
+       << std::setw(14) << "STATUS"
+       << std::setw(14) << "TIME (ms)"
+       << "NOTES\n"
+       << "  ----------------------------------------------------------------------------------------------------------------\n";
+
+    for (const auto& res : summary.account_results) {
+        std::string orders_str = std::to_string(res.orders_succeeded) + "/" + std::to_string(res.orders_generated);
+        std::string status_str = res.success ? "SUCCEEDED" : "FAILED";
+
+        std::ostringstream eq_stream, cash_stream, time_stream;
+        eq_stream << std::fixed << std::setprecision(2) << res.liquidation_value;
+        cash_stream << std::fixed << std::setprecision(2) << res.cash_balance;
+        time_stream << std::fixed << std::setprecision(3) << (res.execution_time.count() / 1000.0);
+
+        ss << "  " << std::left
+           << std::setw(12) << res.masked_account_number
+           << std::setw(14) << res.account_type
+           << std::setw(16) << eq_stream.str()
+           << std::setw(16) << cash_stream.str()
+           << std::setw(10) << orders_str
+           << std::setw(14) << status_str
+           << std::setw(14) << time_stream.str()
+           << res.status_notes << "\n";
+    }
+
+    ss << "  ----------------------------------------------------------------------------------------------------------------\n"
+       << "  Total Accounts: " << summary.total_accounts
+       << " | Succeeded: " << summary.succeeded_accounts
+       << " | Failed: " << summary.failed_accounts
+       << " | Total Orders: " << summary.total_orders_submitted
+       << " (Succeeded: " << summary.total_orders_succeeded
+       << ", Failed: " << summary.total_orders_failed << ")\n"
+       << "  Total Session Time: " << std::fixed << std::setprecision(3)
+       << (summary.total_session_time.count() / 1000.0) << " ms\n"
+       << "================================================================================================================\n\n";
+
+    return ss.str();
+}
+
 int ExecutionRunner::execute(
     std::span<const Position> simulated_positions,
-    std::optional<double> simulated_cash
+    std::optional<double> simulated_cash,
+    std::span<const AccountPortfolio> simulated_accounts
 ) {
     std::cout << "\n================================================================================\n"
               << "  [SCHWAB-EXECUTOR] SESSION EXECUTION RUNNER\n"
@@ -299,26 +352,28 @@ int ExecutionRunner::execute(
         config_.track_fills = cfg.get_bool("SCHWAB_TRACK_FILLS", false);
     }
 
-    // Resolve Account Hash
-    std::string account_hash = config_.account_hash_override;
-    if (account_hash.empty()) {
-        account_hash = cfg.target_account_number;
-    }
-    if (account_hash.empty() && config_.dry_run && !config_.preview_only) {
-        account_hash = "SIMULATED_ACCOUNT";
+    // Populate accounts_filter from config if not explicitly set
+    if (config_.accounts_filter.empty()) {
+        if (!cfg.accounts.empty()) {
+            config_.accounts_filter = cfg.accounts;
+        } else if (cfg.has_param("SCHWAB_ACCOUNTS")) {
+            config_.accounts_filter = cfg.get_string("SCHWAB_ACCOUNTS");
+        } else {
+            config_.accounts_filter = "all";
+        }
     }
 
-    if (account_hash.empty() && (!config_.dry_run || config_.preview_only)) {
-        std::cerr << "  * Error: Target account hash is required for "
-                  << (config_.preview_only ? "broker preview validation.\n" : "live execution.\n")
-                  << "    Set SCHWAB_ACCOUNT_NUMBER in .env or provide --account-hash <hash>.\n\n";
-        return 1;
-    }
+    last_market_quotes_.clear();
 
     // Ensure active OAuth session
     std::string access_token;
     if (config_.dry_run && !config_.preview_only) {
         auto token_opt = TokenManager::load_from_file(config_.token_path);
+        if (token_opt.has_value() && !token_opt->is_refresh_token_expired()) {
+            if (token_opt->is_access_token_expired()) {
+                token_opt = TokenManager::ensure_authenticated(config_.token_path);
+            }
+        }
         if (token_opt.has_value() && !token_opt->is_access_token_expired()) {
             access_token = token_opt->access_token;
             std::cout << "  * OAuth Status       : [AUTHENTICATED] Access Token Valid\n";
@@ -341,32 +396,64 @@ int ExecutionRunner::execute(
         ~TokenScrubber() { secure_clear(tok); }
     } scrubber{access_token};
 
-    // Resolve Current Portfolio Context (Positions & Liquid Cash)
-    std::vector<Position> positions;
-    double available_cash = 0.0;
+    // Resolve Target Accounts to Rebalance
+    std::vector<AccountPortfolio> target_accounts;
 
-    if (!simulated_positions.empty() || simulated_cash.has_value()) {
-        // Use provided mock context (for tests and offline simulations)
-        positions.assign(simulated_positions.begin(), simulated_positions.end());
-        available_cash = simulated_cash.value_or(100'000.0);
-        std::cout << "  * Portfolio Context  : Simulated (" << positions.size() 
-                  << " positions, Cash: $" << std::fixed << std::setprecision(2) << available_cash << ")\n";
-    } else if (config_.dry_run && (access_token == "SIMULATED_ACCESS_TOKEN" || account_hash == "SIMULATED_ACCOUNT")) {
-        available_cash = 100'000.0;
+    if (!simulated_accounts.empty()) {
+        std::string active_filter = config_.accounts_filter;
+        if (!config_.account_hash_override.empty()) {
+            active_filter = config_.account_hash_override;
+        }
+        std::vector<AccountPortfolio> input_accs(simulated_accounts.begin(), simulated_accounts.end());
+        target_accounts = AccountManager::filter_accounts(input_accs, active_filter);
+        if (target_accounts.empty()) {
+            std::cerr << "  * [ERROR] Zero simulated accounts matched filter '" << active_filter << "'.\n\n";
+            return 1;
+        }
+        std::cout << "  * Portfolio Context  : Simulated batch (" << target_accounts.size() << " account(s))\n";
+    } else if (!simulated_positions.empty() || simulated_cash.has_value()) {
+        AccountPortfolio mock_acc;
+        mock_acc.account_number = "SIMULATED";
+        mock_acc.account_hash = config_.account_hash_override.empty() ? "SIMULATED_ACCOUNT" : config_.account_hash_override;
+        mock_acc.cash_balance = simulated_cash.value_or(100'000.0);
+        mock_acc.available_funds = mock_acc.cash_balance;
+        mock_acc.liquidation_value = mock_acc.cash_balance;
+        mock_acc.positions.assign(simulated_positions.begin(), simulated_positions.end());
+        for (const auto& p : mock_acc.positions) {
+            double price = (p.current_price > 0.0) ? p.current_price : p.average_price;
+            mock_acc.liquidation_value += (p.quantity * price);
+        }
+        target_accounts.push_back(std::move(mock_acc));
+        std::cout << "  * Portfolio Context  : Simulated (" << target_accounts[0].positions.size() 
+                  << " positions, Cash: $" << std::fixed << std::setprecision(2) << target_accounts[0].available_cash() << ")\n";
+    } else if (config_.dry_run && !config_.preview_only && access_token == "SIMULATED_ACCESS_TOKEN") {
+        AccountPortfolio sim_acc;
+        sim_acc.account_number = "SIMULATED";
+        sim_acc.account_hash = config_.account_hash_override.empty() ? "SIMULATED_ACCOUNT" : config_.account_hash_override;
+        sim_acc.cash_balance = 100'000.0;
+        sim_acc.available_funds = 100'000.0;
+        sim_acc.liquidation_value = 100'000.0;
+        target_accounts.push_back(std::move(sim_acc));
         std::cout << "  * Portfolio Context  : Offline Simulation (0 positions, Cash: $" 
-                  << std::fixed << std::setprecision(2) << available_cash << ")\n";
+                  << std::fixed << std::setprecision(2) << target_accounts[0].available_cash() << ")\n";
     } else {
-        // Query live Charles Schwab portfolio state
-        std::cout << "  * Portfolio Context  : Querying live Charles Schwab account positions...\n";
+        // Query live Charles Schwab linked accounts
+        std::cout << "  * Portfolio Context  : Querying live Charles Schwab linked accounts...\n";
         std::string fetch_err;
-        auto pf_opt = AccountManager::fetch_portfolio(http_client_, cfg.base_url, account_hash, access_token, &fetch_err);
-        if (pf_opt.has_value()) {
-            positions = std::move(pf_opt->positions);
-            available_cash = pf_opt->available_cash();
-            std::cout << "  * Portfolio Context  : Live Account (" << positions.size() 
-                      << " positions, Cash: $" << std::fixed << std::setprecision(2) << available_cash
-                      << ", Liquidation Value: $" << pf_opt->liquidation_value << ")\n";
-        } else {
+        auto all_linked = AccountManager::fetch_linked_accounts(http_client_, cfg.base_url, access_token, &fetch_err);
+
+        // Single account fallback if fetch_linked_accounts returned empty
+        if (all_linked.empty()) {
+            std::string single_hash = !config_.account_hash_override.empty() ? config_.account_hash_override : config_.accounts_filter;
+            if (!single_hash.empty()) {
+                auto pf_opt = AccountManager::fetch_portfolio(http_client_, cfg.base_url, single_hash, access_token, &fetch_err);
+                if (pf_opt.has_value()) {
+                    all_linked.push_back(std::move(*pf_opt));
+                }
+            }
+        }
+
+        if (all_linked.empty()) {
             std::cerr << "  * [CRITICAL ERROR] Failed to fetch live account portfolio from Schwab: " 
                       << fetch_err << "\n";
             if (!config_.dry_run) {
@@ -374,270 +461,433 @@ int ExecutionRunner::execute(
                 return 1;
             }
             std::cout << "  * Simulation fallback: using default cash context for dry-run validation.\n";
-            available_cash = 100'000.0;
+            AccountPortfolio fallback_acc;
+            fallback_acc.account_number = "SIMULATED";
+            fallback_acc.account_hash = "SIMULATED_ACCOUNT";
+            fallback_acc.cash_balance = 100'000.0;
+            fallback_acc.available_funds = 100'000.0;
+            fallback_acc.liquidation_value = 100'000.0;
+            target_accounts.push_back(std::move(fallback_acc));
+        } else {
+            std::string active_filter = config_.accounts_filter;
+            if (!config_.account_hash_override.empty()) {
+                active_filter = config_.account_hash_override;
+            }
+            target_accounts = AccountManager::filter_accounts(all_linked, active_filter);
+            if (target_accounts.empty()) {
+                std::cerr << "  * [ERROR] Zero accounts matched filter '" << active_filter 
+                          << "' (found " << all_linked.size() << " linked account(s)).\n\n";
+                return 1;
+            }
+            std::string display_filter = active_filter;
+            if (display_filter.length() > 16) {
+                display_filter = display_filter.substr(0, 4) + "..." + display_filter.substr(display_filter.length() - 4);
+            }
+            std::cout << "  * Accounts Resolved  : " << target_accounts.size() << " account(s) selected for execution (Filter: '" 
+                      << (display_filter.empty() ? "all" : display_filter) << "')\n";
         }
     }
 
-    // Generate Strategy Session Orders
-    std::vector<Order> raw_orders = strategy_->generate_orders(
-        positions,
-        available_cash
-    );
-
-    std::cout << "  * Strategy Output    : " << raw_orders.size() << " orders emitted by strategy\n";
-
-    if (raw_orders.empty()) {
-        std::cout << "  * Status: [COMPLETED] Zero orders generated by strategy. Zero execution needed.\n"
-                  << "================================================================================\n\n";
-        return 0;
-    }
-
-    // Pre-Trade RiskGuard Validation (Notional caps, collars, spread breaker, MOC cutoff)
+    // Pre-Trade RiskGuard Limit Configuration
     RiskLimits limits;
     limits.max_order_notional = cfg.execution.max_order_notional;
     limits.price_collar_percent = cfg.get_double("SCHWAB_PRICE_COLLAR_PERCENT", 0.05);
     limits.max_bid_ask_spread_bps = cfg.get_double("SCHWAB_MAX_SPREAD_BPS", 50.0);
     limits.enforce_moc_cutoff = !config_.dry_run && !config_.preview_only;
-    limits.dry_run = false; // Allow plan generation; ExecutionDriver handles dry-run simulation
+    limits.dry_run = false;
     limits.reject_crossed_book = true;
     RiskGuard risk_guard(limits);
 
-    std::vector<Order> approved_orders;
-    approved_orders.reserve(raw_orders.size());
+    auto session_start = std::chrono::steady_clock::now();
+    BatchSessionSummary batch_summary;
+    batch_summary.total_accounts = target_accounts.size();
 
-    // Real-Time Market Data Valuation
-    std::vector<Symbol> symbols_to_quote;
-    symbols_to_quote.reserve(raw_orders.size());
-    for (const auto& ord : raw_orders) {
-        if (!ord.symbol.is_valid()) continue;
-        if (std::find(symbols_to_quote.begin(), symbols_to_quote.end(), ord.symbol) == symbols_to_quote.end()) {
-            symbols_to_quote.push_back(ord.symbol);
+    // Pre-resolve market data quotes for strategy target symbols and portfolio holdings
+    std::vector<Symbol> pre_quote_symbols;
+    auto strat_targets = strategy_->target_symbols();
+    for (const auto& sym : strat_targets) {
+        if (sym.is_valid() && std::find(pre_quote_symbols.begin(), pre_quote_symbols.end(), sym) == pre_quote_symbols.end()) {
+            if (find_quote(last_market_quotes_, sym) == nullptr) {
+                pre_quote_symbols.push_back(sym);
+            }
+        }
+    }
+    for (const auto& acc : target_accounts) {
+        for (const auto& pos : acc.positions) {
+            if (pos.symbol.is_valid() && std::find(pre_quote_symbols.begin(), pre_quote_symbols.end(), pos.symbol) == pre_quote_symbols.end()) {
+                if (find_quote(last_market_quotes_, pos.symbol) == nullptr) {
+                    pre_quote_symbols.push_back(pos.symbol);
+                }
+            }
         }
     }
 
-    // Deferred diagnostics buffer to keep order validation and dispatch silent and zero-I/O
-    std::vector<std::string> deferred_diagnostics;
-    deferred_diagnostics.reserve(raw_orders.size() + 4);
-
-    last_market_quotes_.clear();
-    if (!symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
+    if (!pre_quote_symbols.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
         std::string quote_err;
-        last_market_quotes_ = MarketDataManager::fetch_quotes_batch(
+        auto initial_quotes = MarketDataManager::fetch_quotes_batch(
             http_client_,
-            symbols_to_quote,
+            pre_quote_symbols,
             access_token,
             &quote_err
         );
-        if (!last_market_quotes_.empty()) {
-            deferred_diagnostics.push_back("  * Market Data Quotes : Fetched " + 
-                std::to_string(last_market_quotes_.size()) + " real-time quote(s)");
-        } else if (!quote_err.empty()) {
-            deferred_diagnostics.push_back("  * Market Data Notice : Quote fetch notice: " + 
-                quote_err + " (falling back to portfolio position marks)");
-        }
-    }
-
-    // Institutional Sequencing: Partition Sells first, Buys second
-    std::vector<Order> staged_sells;
-    std::vector<Order> staged_buys;
-    staged_sells.reserve(raw_orders.size());
-    staged_buys.reserve(raw_orders.size());
-
-    for (const auto& ord : raw_orders) {
-        if (ord.side == OrderSide::Sell) {
-            staged_sells.push_back(ord);
-        } else {
-            staged_buys.push_back(ord);
-        }
-    }
-
-    bool has_rejected_sells = false;
-
-    // PASS 1: Validate and Stage Sells
-    for (const auto& ord : staged_sells) {
-        const Position* pos = find_position(positions, ord.symbol);
-        const double current_qty = pos ? pos->quantity : 0.0;
-        const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
-
-        RiskCheckResult check;
-        if (quote != nullptr) {
-            check = risk_guard.validate_order(ord, *quote, current_qty);
-        } else {
-            const double market_price = resolve_reference_price(
-                ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
-            );
-            if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
-                has_rejected_sells = true;
-                continue; // Rejected at risk gate (unquoted and unpositioned)
+        if (!initial_quotes.empty()) {
+            std::cout << "  * Market Data Quotes : Pre-fetched " << initial_quotes.size() << " real-time quote(s) for valuation\n";
+            for (auto& q : initial_quotes) {
+                last_market_quotes_.push_back(std::move(q));
             }
-            check = risk_guard.validate_order(ord, current_qty, market_price);
-        }
-
-        if (check.approved) {
-            approved_orders.push_back(ord);
-        } else {
-            has_rejected_sells = true;
-            std::string msg = "  * [RISK WARNING] Order rejected for ";
-            msg.append(ord.symbol.view());
-            msg.append(": ");
-            msg.append(check.message);
-            deferred_diagnostics.push_back(std::move(msg));
+        } else if (!quote_err.empty()) {
+            std::cout << "  * Market Data Notice : Quote pre-fetch notice: " << quote_err << "\n";
         }
     }
 
-    // PASS 2: Validate and Stage Buys (Enforcing Atomic Abort if preceding Sells were blocked)
-    for (const auto& ord : staged_buys) {
-        if (has_rejected_sells) [[unlikely]] {
-            std::string msg = "  * [ATOMIC ABORT] Buy order aborted for ";
-            msg.append(ord.symbol.view());
-            msg.append(": preceding sell order was blocked by risk controls");
-            deferred_diagnostics.push_back(std::move(msg));
+    // Iterate through resolved accounts
+    for (size_t acc_idx = 0; acc_idx < target_accounts.size(); ++acc_idx) {
+        auto& acc = target_accounts[acc_idx];
+        auto acc_start = std::chrono::steady_clock::now();
+
+        AccountSessionResult acc_res;
+        acc_res.account_number = acc.account_number;
+        acc_res.masked_account_number = acc.masked_account_number();
+        acc_res.account_hash = acc.account_hash;
+        acc_res.account_type = acc.account_type;
+        acc_res.cash_balance = acc.cash_balance;
+        acc_res.liquidation_value = acc.liquidation_value;
+        acc_res.positions_count = acc.positions.size();
+
+        if (target_accounts.size() > 1) {
+            std::cout << "\n--------------------------------------------------------------------------------\n"
+                      << "  [ACCOUNT " << (acc_idx + 1) << "/" << target_accounts.size() << "] "
+                      << acc.masked_account_number() << " (" << acc.account_type << ")\n"
+                      << "--------------------------------------------------------------------------------\n"
+                      << "  * Available Cash     : $" << std::fixed << std::setprecision(2) << acc.available_cash() << "\n"
+                      << "  * Liquidation Value  : $" << std::fixed << std::setprecision(2) << acc.liquidation_value << "\n"
+                      << "  * Existing Positions : " << acc.positions.size() << "\n";
+        }
+
+        // Validate account hash for broker execution
+        if (acc.account_hash.empty()) {
+            if (config_.dry_run && !config_.preview_only) {
+                acc.account_hash = "SIMULATED_ACCOUNT";
+            } else {
+                std::cerr << "  * [ERROR] Account " << acc.masked_account_number() << " missing encrypted hashValue. Skipping.\n";
+                acc_res.success = false;
+                acc_res.status_notes = "Missing hashValue";
+                acc_res.execution_time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - acc_start);
+                batch_summary.failed_accounts++;
+                batch_summary.account_results.push_back(std::move(acc_res));
+                continue;
+            }
+        }
+
+        // Generate Strategy Session Orders
+        std::vector<Order> raw_orders = strategy_->generate_orders(
+            acc.positions,
+            acc.available_cash(),
+            last_market_quotes_
+        );
+
+        acc_res.orders_generated = raw_orders.size();
+        std::cout << "  * Strategy Output    : " << raw_orders.size() << " orders emitted by strategy\n";
+
+        if (raw_orders.empty()) {
+            std::cout << "  * Status: [COMPLETED] Zero orders generated by strategy. Zero execution needed.\n";
+            if (target_accounts.size() == 1) {
+                std::cout << "================================================================================\n\n";
+            }
+            acc_res.success = true;
+            acc_res.status_notes = "Zero orders needed";
+            acc_res.execution_time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - acc_start);
+            batch_summary.succeeded_accounts++;
+            batch_summary.account_results.push_back(std::move(acc_res));
             continue;
         }
 
-        const Position* pos = find_position(positions, ord.symbol);
-        const double current_qty = pos ? pos->quantity : 0.0;
-        const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
-
-        RiskCheckResult check;
-        if (quote != nullptr) {
-            check = risk_guard.validate_order(ord, *quote, current_qty);
-        } else {
-            const double market_price = resolve_reference_price(
-                ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
-            );
-            if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
-                continue; // Rejected at risk gate (unquoted and unpositioned)
-            }
-            check = risk_guard.validate_order(ord, current_qty, market_price);
-        }
-
-        if (check.approved) {
-            approved_orders.push_back(ord);
-        } else {
-            std::string msg = "  * [RISK WARNING] Order rejected for ";
-            msg.append(ord.symbol.view());
-            msg.append(": ");
-            msg.append(check.message);
-            deferred_diagnostics.push_back(std::move(msg));
-        }
-    }
-
-    if (approved_orders.empty()) {
-        for (const auto& diag : deferred_diagnostics) {
-            std::cerr << diag << "\n";
-        }
-        std::cerr << "  * Error: All strategy orders were blocked by RiskGuard.\n\n";
-        return 1;
-    }
-
-    // Pre-warm HTTP transport and Dispatch Rebalance Plan
-    if ((!config_.dry_run || config_.preview_only) && !http_client_.is_connected()) {
-        http_client_.prewarm();
-    }
-
-    RebalancePlan plan;
-    plan.orders = std::move(approved_orders);
-
-    ExecutionDriverConfig driver_cfg;
-    driver_cfg.account_hash = account_hash;
-    driver_cfg.dry_run = config_.dry_run && !config_.preview_only;
-    driver_cfg.preview_only = config_.preview_only;
-    driver_cfg.stop_on_auth_failure = true;
-    driver_cfg.abort_buys_on_sell_failure = true;
-
-    ExecutionDriver driver(http_client_, driver_cfg);
-    ExecutionReport report = driver.execute_plan(plan, access_token);
-
-    // Flush Deferred Diagnostics and Output Formatted Telemetry Table Post-Execution
-    for (const auto& diag : deferred_diagnostics) {
-        std::cout << diag << "\n";
-    }
-
-    // Output Formatted Telemetry Table and Save to History/File
-    std::string table_str = format_telemetry_table(report, config_.dry_run, config_.preview_only);
-    std::cout << table_str;
-
-    execution_history_.push_back(report);
-
-    if (telemetry_callback_) {
-        telemetry_callback_(report);
-    }
-
-    std::string recon_table_str;
-    if (config_.track_fills && report.total_succeeded > 0 && !config_.preview_only) {
-        if (!config_.dry_run) {
-            std::cout << "  * Order Tracking     : Reconciling post-dispatch fills with Charles Schwab...\n";
-            OrderTrackerConfig tracker_cfg;
-            tracker_cfg.account_hash = account_hash;
-            tracker_cfg.polling_interval_ms = config_.fill_poll_interval_ms;
-            tracker_cfg.timeout_ms = config_.fill_poll_timeout_ms;
-
-            OrderTracker tracker(http_client_, tracker_cfg);
-            BatchReconciliationReport recon = tracker.reconcile_report(report, access_token, last_market_quotes_);
-
-            recon_table_str = format_reconciliation_table(recon, last_market_quotes_);
-            std::cout << recon_table_str;
-            last_reconciliation_report_ = recon;
-        } else {
-            // Simulated dry-run fill reconciliation
-            BatchReconciliationReport sim_recon;
-            sim_recon.orders.reserve(report.results.size());
-            for (const auto& res : report.results) {
-                OrderReconciliationResult r;
-                r.symbol = res.order.symbol;
-                r.side = res.order.side;
-                r.ordered_quantity = res.order.quantity;
-                r.filled_quantity = res.order.quantity;
-                r.order_id = res.order_id.value_or("DRY_RUN_SIMULATED");
-                r.final_state = OrderExecutionState::Filled;
-                r.is_terminal = true;
-                r.is_filled = true;
-                const Quote* q = find_quote(last_market_quotes_, r.symbol);
-                if (q != nullptr && q->is_valid()) {
-                    double ref = (r.side == OrderSide::Buy) ? q->ask_price : q->bid_price;
-                    if (ref <= 0.0) ref = q->reference_price();
-                    r.average_fill_price = ref;
-                    r.slippage = calculate_slippage(r.side, ref, ref);
-                } else {
-                    r.average_fill_price = res.order.limit_price.value_or(100.0);
+        // Real-Time Market Data Valuation (Fetch any new symbols needed)
+        std::vector<Symbol> symbols_to_quote;
+        for (const auto& ord : raw_orders) {
+            if (!ord.symbol.is_valid()) continue;
+            if (find_quote(last_market_quotes_, ord.symbol) == nullptr) {
+                if (std::find(symbols_to_quote.begin(), symbols_to_quote.end(), ord.symbol) == symbols_to_quote.end()) {
+                    symbols_to_quote.push_back(ord.symbol);
                 }
-                sim_recon.orders.push_back(std::move(r));
             }
-            sim_recon.total_tracked = sim_recon.orders.size();
-            sim_recon.total_filled = sim_recon.orders.size();
-            sim_recon.all_terminal = true;
-            sim_recon.all_filled = true;
-            recon_table_str = format_reconciliation_table(sim_recon, last_market_quotes_);
-            std::cout << recon_table_str;
-            last_reconciliation_report_ = sim_recon;
         }
-    }
 
-    if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
-        std::error_code ec;
-        if (config_.telemetry_log_path->has_parent_path()) {
-            std::filesystem::create_directories(config_.telemetry_log_path->parent_path(), ec);
+        std::vector<std::string> deferred_diagnostics;
+        deferred_diagnostics.reserve(raw_orders.size() + 4);
+
+        if (!symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
+            std::string quote_err;
+            auto new_quotes = MarketDataManager::fetch_quotes_batch(
+                http_client_,
+                symbols_to_quote,
+                access_token,
+                &quote_err
+            );
+            if (!new_quotes.empty()) {
+                deferred_diagnostics.push_back("  * Market Data Quotes : Fetched " + 
+                    std::to_string(new_quotes.size()) + " real-time quote(s)");
+                for (auto& q : new_quotes) {
+                    last_market_quotes_.push_back(std::move(q));
+                }
+            } else if (!quote_err.empty()) {
+                deferred_diagnostics.push_back("  * Market Data Notice : Quote fetch notice: " + 
+                    quote_err + " (falling back to portfolio position marks)");
+            }
+        } else if (!raw_orders.empty()) {
+            size_t quoted_count = 0;
+            for (const auto& ord : raw_orders) {
+                if (find_quote(last_market_quotes_, ord.symbol) != nullptr) {
+                    quoted_count++;
+                }
+            }
+            if (quoted_count > 0) {
+                deferred_diagnostics.push_back("  * Market Data Quotes : Valued with " + 
+                    std::to_string(quoted_count) + " real-time quote(s)");
+            }
         }
-        std::ofstream log_file(*config_.telemetry_log_path, std::ios::app);
-        if (log_file.is_open()) {
-            auto now_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-            std::tm gm_tm;
+
+        // Sequencing: Partition Sells first, Buys second
+        std::vector<Order> staged_sells;
+        std::vector<Order> staged_buys;
+        staged_sells.reserve(raw_orders.size());
+        staged_buys.reserve(raw_orders.size());
+
+        for (const auto& ord : raw_orders) {
+            if (ord.side == OrderSide::Sell) {
+                staged_sells.push_back(ord);
+            } else {
+                staged_buys.push_back(ord);
+            }
+        }
+
+        std::vector<Order> approved_orders;
+        approved_orders.reserve(raw_orders.size());
+        bool has_rejected_sells = false;
+
+        // PASS 1: Validate and Stage Sells
+        for (const auto& ord : staged_sells) {
+            const Position* pos = find_position(acc.positions, ord.symbol);
+            const double current_qty = pos ? pos->quantity : 0.0;
+            const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
+
+            RiskCheckResult check;
+            if (quote != nullptr) {
+                check = risk_guard.validate_order(ord, *quote, current_qty);
+            } else {
+                const double market_price = resolve_reference_price(
+                    ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
+                );
+                if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
+                    has_rejected_sells = true;
+                    continue;
+                }
+                check = risk_guard.validate_order(ord, current_qty, market_price);
+            }
+
+            if (check.approved) {
+                approved_orders.push_back(ord);
+            } else {
+                has_rejected_sells = true;
+                std::string msg = "  * [RISK WARNING] Order rejected for ";
+                msg.append(ord.symbol.view());
+                msg.append(": ");
+                msg.append(check.message);
+                deferred_diagnostics.push_back(std::move(msg));
+            }
+        }
+
+        // PASS 2: Validate and Stage Buys (Enforcing Atomic Abort if preceding Sells were blocked)
+        for (const auto& ord : staged_buys) {
+            if (has_rejected_sells) [[unlikely]] {
+                std::string msg = "  * [ATOMIC ABORT] Buy order aborted for ";
+                msg.append(ord.symbol.view());
+                msg.append(": preceding sell order was blocked by risk controls");
+                deferred_diagnostics.push_back(std::move(msg));
+                continue;
+            }
+
+            const Position* pos = find_position(acc.positions, ord.symbol);
+            const double current_qty = pos ? pos->quantity : 0.0;
+            const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
+
+            RiskCheckResult check;
+            if (quote != nullptr) {
+                check = risk_guard.validate_order(ord, *quote, current_qty);
+            } else {
+                const double market_price = resolve_reference_price(
+                    ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
+                );
+                if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
+                    continue;
+                }
+                check = risk_guard.validate_order(ord, current_qty, market_price);
+            }
+
+            if (check.approved) {
+                approved_orders.push_back(ord);
+            } else {
+                std::string msg = "  * [RISK WARNING] Order rejected for ";
+                msg.append(ord.symbol.view());
+                msg.append(": ");
+                msg.append(check.message);
+                deferred_diagnostics.push_back(std::move(msg));
+            }
+        }
+
+        if (approved_orders.empty()) {
+            for (const auto& diag : deferred_diagnostics) {
+                std::cerr << diag << "\n";
+            }
+            std::cerr << "  * Error: All strategy orders were blocked by RiskGuard.\n\n";
+            acc_res.success = false;
+            acc_res.status_notes = "Blocked by RiskGuard";
+            acc_res.execution_time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - acc_start);
+            batch_summary.failed_accounts++;
+            batch_summary.account_results.push_back(std::move(acc_res));
+            continue;
+        }
+
+        // Pre-warm HTTP transport and Dispatch Rebalance Plan
+        if ((!config_.dry_run || config_.preview_only) && !http_client_.is_connected()) {
+            http_client_.prewarm();
+        }
+
+        RebalancePlan plan;
+        plan.orders = std::move(approved_orders);
+
+        ExecutionDriverConfig driver_cfg;
+        driver_cfg.account_hash = acc.account_hash;
+        driver_cfg.dry_run = config_.dry_run && !config_.preview_only;
+        driver_cfg.preview_only = config_.preview_only;
+        driver_cfg.stop_on_auth_failure = true;
+        driver_cfg.abort_buys_on_sell_failure = true;
+
+        ExecutionDriver driver(http_client_, driver_cfg);
+        ExecutionReport report = driver.execute_plan(plan, access_token);
+
+        // Flush Deferred Diagnostics and Output Formatted Telemetry Table Post-Execution
+        for (const auto& diag : deferred_diagnostics) {
+            std::cout << diag << "\n";
+        }
+
+        std::string table_str = format_telemetry_table(report, config_.dry_run, config_.preview_only);
+        std::cout << table_str;
+
+        execution_history_.push_back(report);
+
+        if (telemetry_callback_) {
+            telemetry_callback_(report);
+        }
+
+        std::string recon_table_str;
+        if (config_.track_fills && report.total_succeeded > 0 && !config_.preview_only) {
+            if (!config_.dry_run) {
+                std::cout << "  * Order Tracking     : Reconciling post-dispatch fills with Charles Schwab...\n";
+                OrderTrackerConfig tracker_cfg;
+                tracker_cfg.account_hash = acc.account_hash;
+                tracker_cfg.polling_interval_ms = config_.fill_poll_interval_ms;
+                tracker_cfg.timeout_ms = config_.fill_poll_timeout_ms;
+
+                OrderTracker tracker(http_client_, tracker_cfg);
+                BatchReconciliationReport recon = tracker.reconcile_report(report, access_token, last_market_quotes_);
+
+                recon_table_str = format_reconciliation_table(recon, last_market_quotes_);
+                std::cout << recon_table_str;
+                last_reconciliation_report_ = recon;
+            } else {
+                BatchReconciliationReport sim_recon;
+                sim_recon.orders.reserve(report.results.size());
+                for (const auto& res : report.results) {
+                    OrderReconciliationResult r;
+                    r.symbol = res.order.symbol;
+                    r.side = res.order.side;
+                    r.ordered_quantity = res.order.quantity;
+                    r.filled_quantity = res.order.quantity;
+                    r.order_id = res.order_id.value_or("DRY_RUN_SIMULATED");
+                    r.final_state = OrderExecutionState::Filled;
+                    r.is_terminal = true;
+                    r.is_filled = true;
+                    const Quote* q = find_quote(last_market_quotes_, r.symbol);
+                    if (q != nullptr && q->is_valid()) {
+                        double ref = (r.side == OrderSide::Buy) ? q->ask_price : q->bid_price;
+                        if (ref <= 0.0) ref = q->reference_price();
+                        r.average_fill_price = ref;
+                        r.slippage = calculate_slippage(r.side, ref, ref);
+                    } else {
+                        r.average_fill_price = res.order.limit_price.value_or(100.0);
+                    }
+                    sim_recon.orders.push_back(std::move(r));
+                }
+                sim_recon.total_tracked = sim_recon.orders.size();
+                sim_recon.total_filled = sim_recon.orders.size();
+                sim_recon.all_terminal = true;
+                sim_recon.all_filled = true;
+                recon_table_str = format_reconciliation_table(sim_recon, last_market_quotes_);
+                std::cout << recon_table_str;
+                last_reconciliation_report_ = sim_recon;
+            }
+        }
+
+        if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
+            std::error_code ec;
+            if (config_.telemetry_log_path->has_parent_path()) {
+                std::filesystem::create_directories(config_.telemetry_log_path->parent_path(), ec);
+            }
+            std::ofstream log_file(*config_.telemetry_log_path, std::ios::app);
+            if (log_file.is_open()) {
+                auto now_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                std::tm gm_tm;
 #if defined(_WIN32)
-            gmtime_s(&gm_tm, &now_t);
+                gmtime_s(&gm_tm, &now_t);
 #else
-            gmtime_r(&now_t, &gm_tm);
+                gmtime_r(&now_t, &gm_tm);
 #endif
-            log_file << "[" << std::put_time(&gm_tm, "%Y-%m-%d %H:%M:%S UTC") << "] "
-                     << "Mode: " << config_.session_name << " | Strategy: " << strategy_->name() << "\n"
-                     << table_str << "\n";
-            if (!recon_table_str.empty()) {
-                log_file << recon_table_str << "\n";
+                log_file << "[" << std::put_time(&gm_tm, "%Y-%m-%d %H:%M:%S UTC") << "] "
+                         << "Mode: " << config_.session_name << " | Strategy: " << strategy_->name()
+                         << " | Account: " << acc.masked_account_number() << "\n"
+                         << table_str << "\n";
+                if (!recon_table_str.empty()) {
+                    log_file << recon_table_str << "\n";
+                }
+            }
+        }
+
+        acc_res.orders_succeeded = report.total_succeeded;
+        acc_res.orders_failed = report.total_failed;
+        acc_res.success = report.all_succeeded;
+        acc_res.status_notes = report.all_succeeded ? "All orders completed" : "Dispatch failures";
+        acc_res.execution_time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - acc_start);
+
+        if (report.all_succeeded) {
+            batch_summary.succeeded_accounts++;
+        } else {
+            batch_summary.failed_accounts++;
+        }
+        batch_summary.total_orders_submitted += report.total_submitted;
+        batch_summary.total_orders_succeeded += report.total_succeeded;
+        batch_summary.total_orders_failed += report.total_failed;
+        batch_summary.account_results.push_back(std::move(acc_res));
+    }
+
+    batch_summary.total_session_time = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - session_start
+    );
+    last_batch_summary_ = batch_summary;
+
+    if (target_accounts.size() > 1) {
+        std::string summary_table = format_batch_summary_table(batch_summary);
+        std::cout << summary_table;
+
+        if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
+            std::ofstream log_file(*config_.telemetry_log_path, std::ios::app);
+            if (log_file.is_open()) {
+                log_file << summary_table << "\n";
             }
         }
     }
 
-    return report.all_succeeded ? 0 : 1;
+    return (batch_summary.failed_accounts == 0) ? 0 : 1;
 }
 
 } // namespace schwab

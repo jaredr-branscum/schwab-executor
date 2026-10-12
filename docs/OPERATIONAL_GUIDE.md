@@ -65,7 +65,7 @@ SCHWAB_APP_SECRET=<your_app_secret>
 SCHWAB_CALLBACK_URL=https://127.0.0.1
 SCHWAB_TOKEN_PATH=.schwab_token.json
 SCHWAB_BASE_URL=https://api.schwabapi.com
-SCHWAB_ACCOUNT_NUMBER=<your_account_hash>
+SCHWAB_ACCOUNTS=all
 SCHWAB_DRY_RUN=true
 SCHWAB_MAX_ORDER_NOTIONAL=100000.0
 SCHWAB_REQUEST_TIMEOUT_MS=5000
@@ -262,9 +262,10 @@ All trade executions emit ASCII telemetry records. When `--telemetry-log` or `SC
   1. The execution driver implements sequential ordering with latency measurement; avoid firing automated requests faster than 120 calls per minute.
   2. Avoid running multiple simultaneous processes with the same app key.
 
-### Issue 4: Missing Account Hash
-- **Symptom:** Execution outputs `Target account hash is required for live execution`.
-- **Root Cause:** `SCHWAB_ACCOUNT_NUMBER` is not configured in `.env` and `--account-hash` was not provided.
+### Issue 4: Missing Account Specification
+- **Symptom:** Execution outputs `Zero accounts matched filter` or account query error.
+- **Root Cause:** Neither `SCHWAB_ACCOUNTS` nor `--accounts` nor `--account-hash` was provided or no linked accounts matched.
 - **Remediation:**
-  1. Run `.\build\Debug\schwab_executor.exe status` to view linked account hashes.
-  2. Set `SCHWAB_ACCOUNT_NUMBER=<hash>` in `.env` or pass `--account-hash <hash>` on the command line.
+  1. Run `.\build\Debug\schwab_executor.exe status` to view linked accounts and encrypted hashes.
+  2. Set `SCHWAB_ACCOUNTS=all` in `.env` (or pass `--accounts all` on the CLI) to target all linked accounts.
+  3. Alternatively, specify account numbers or hashes: `SCHWAB_ACCOUNTS=1234,5678`.

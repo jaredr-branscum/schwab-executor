@@ -190,7 +190,42 @@ std::optional<AccountPortfolio> AccountManager::fetch_portfolio(
     return pf_opt;
 }
 
-std::vector<AccountPortfolio> AccountManager::fetch_linked_accounts(
+std::vector<AccountNumberMapping> AccountManager::parse_account_numbers(
+    std::string_view json_str,
+    std::string* error_msg
+) {
+    if (json_str.empty()) {
+        if (error_msg) *error_msg = "Empty JSON response received";
+        return {};
+    }
+
+    try {
+        auto root = nlohmann::json::parse(json_str);
+        if (!root.is_array()) {
+            if (error_msg) *error_msg = "Account numbers response is not a JSON array";
+            return {};
+        }
+
+        std::vector<AccountNumberMapping> mappings;
+        mappings.reserve(root.size());
+        for (const auto& item : root) {
+            if (!item.is_object()) {
+                continue;
+            }
+            std::string num = parse_json_string(item, "accountNumber");
+            std::string hash = parse_json_string(item, "hashValue");
+            if (!num.empty() || !hash.empty()) {
+                mappings.push_back(AccountNumberMapping{std::move(num), std::move(hash)});
+            }
+        }
+        return mappings;
+    } catch (const nlohmann::json::exception& e) {
+        if (error_msg) *error_msg = std::string("JSON parse error: ") + e.what();
+        return {};
+    }
+}
+
+std::vector<AccountNumberMapping> AccountManager::fetch_account_numbers(
     HttpClient& client,
     std::string_view base_url,
     std::string_view access_token,
@@ -201,7 +236,7 @@ std::vector<AccountPortfolio> AccountManager::fetch_linked_accounts(
         return {};
     }
 
-    std::string path = "/trader/v1/accounts";
+    std::string path = "/trader/v1/accounts/accountNumbers";
     std::string auth_header = "Bearer ";
     auth_header.append(access_token);
 
@@ -215,8 +250,20 @@ std::vector<AccountPortfolio> AccountManager::fetch_linked_accounts(
         return {};
     }
 
+    return parse_account_numbers(resp.body, error_msg);
+}
+
+std::vector<AccountPortfolio> AccountManager::parse_linked_accounts(
+    std::string_view json_str,
+    std::string* error_msg
+) {
+    if (json_str.empty()) {
+        if (error_msg) *error_msg = "Empty JSON response received";
+        return {};
+    }
+
     try {
-        auto root = nlohmann::json::parse(resp.body);
+        auto root = nlohmann::json::parse(json_str);
         std::vector<AccountPortfolio> portfolios;
         if (root.is_array()) {
             portfolios.reserve(root.size());
@@ -227,12 +274,150 @@ std::vector<AccountPortfolio> AccountManager::fetch_linked_accounts(
                     portfolios.push_back(parse_single_account(item));
                 }
             }
+        } else if (root.is_object()) {
+            if (root.contains("securitiesAccount") && root["securitiesAccount"].is_object()) {
+                portfolios.push_back(parse_single_account(root["securitiesAccount"]));
+            } else {
+                portfolios.push_back(parse_single_account(root));
+            }
+        } else {
+            if (error_msg) *error_msg = "JSON root is neither object nor array";
         }
         return portfolios;
     } catch (const nlohmann::json::exception& e) {
         if (error_msg) *error_msg = std::string("JSON parse error: ") + e.what();
         return {};
     }
+}
+
+std::vector<AccountPortfolio> AccountManager::fetch_linked_accounts(
+    HttpClient& client,
+    std::string_view base_url,
+    std::string_view access_token,
+    std::string* error_msg
+) {
+    if (access_token.empty()) {
+        if (error_msg) *error_msg = "Access token is empty";
+        return {};
+    }
+
+    // Fetch linked account hashes
+    std::string num_err;
+    auto mappings = fetch_account_numbers(client, base_url, access_token, &num_err);
+
+    // Fetch linked account portfolios with positions
+    std::string path = "/trader/v1/accounts?fields=positions";
+    std::string auth_header = "Bearer ";
+    auth_header.append(access_token);
+
+    (void)base_url;
+    HttpResponse resp = client.get(path, auth_header);
+
+    if (resp.status_code != 200) {
+        // Fallback without fields parameter
+        if (resp.status_code == 400 || resp.status_code == 404) {
+            resp = client.get("/trader/v1/accounts", auth_header);
+        }
+        if (resp.status_code != 200) {
+            if (error_msg) {
+                *error_msg = "HTTP " + std::to_string(resp.status_code) + ": " + resp.body;
+            }
+            return {};
+        }
+    }
+
+    auto portfolios = parse_linked_accounts(resp.body, error_msg);
+
+    // Correlate and merge hashValue into each portfolio
+    for (auto& pf : portfolios) {
+        for (const auto& m : mappings) {
+            if (pf.account_number == m.account_number) {
+                pf.account_hash = m.hash_value;
+                break;
+            }
+        }
+    }
+
+    return portfolios;
+}
+
+bool AccountManager::matches_account_filter(
+    const AccountPortfolio& account,
+    std::string_view filter_str
+) noexcept {
+    if (filter_str.empty()) {
+        return true;
+    }
+
+    auto trim_view = [](std::string_view s) noexcept -> std::string_view {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) {
+            s.remove_prefix(1);
+        }
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) {
+            s.remove_suffix(1);
+        }
+        return s;
+    };
+
+    std::string_view remaining = filter_str;
+    while (!remaining.empty()) {
+        auto comma_pos = remaining.find_first_of(",;");
+        std::string_view token;
+        if (comma_pos == std::string_view::npos) {
+            token = trim_view(remaining);
+            remaining = {};
+        } else {
+            token = trim_view(remaining.substr(0, comma_pos));
+            remaining.remove_prefix(comma_pos + 1);
+        }
+
+        if (token.empty()) {
+            continue;
+        }
+
+        // Case-insensitive check for "all"
+        if (token.size() == 3 &&
+            (token[0] == 'a' || token[0] == 'A') &&
+            (token[1] == 'l' || token[1] == 'L') &&
+            (token[2] == 'l' || token[2] == 'L')) {
+            return true;
+        }
+
+        // Direct match with account number or hash
+        if (token == account.account_number || token == account.account_hash) {
+            return true;
+        }
+
+        // Suffix match for last N digits of account number (e.g. "2222" matches "11112222")
+        if (account.account_number.size() >= token.size() &&
+            account.account_number.compare(account.account_number.size() - token.size(), token.size(), token) == 0) {
+            return true;
+        }
+
+        // Prefix or suffix match for hash
+        if (account.account_hash.size() >= token.size()) {
+            if (account.account_hash.compare(0, token.size(), token) == 0 ||
+                account.account_hash.compare(account.account_hash.size() - token.size(), token.size(), token) == 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+std::vector<AccountPortfolio> AccountManager::filter_accounts(
+    const std::vector<AccountPortfolio>& accounts,
+    std::string_view filter_str
+) {
+    std::vector<AccountPortfolio> matched;
+    matched.reserve(accounts.size());
+    for (const auto& acc : accounts) {
+        if (matches_account_filter(acc, filter_str)) {
+            matched.push_back(acc);
+        }
+    }
+    return matched;
 }
 
 } // namespace schwab

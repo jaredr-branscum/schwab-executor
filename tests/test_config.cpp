@@ -107,7 +107,7 @@ TEST_CASE("Config loading from string (.env parser)", "[config]") {
             "SCHWAB_CALLBACK_URL = https://127.0.0.1/auth  # OAuth redirect endpoint\n"
             "SCHWAB_BASE_URL='https://api.schwabapi.com'\n"
             "SCHWAB_TOKEN_PATH=.my_tokens.json\n"
-            "SCHWAB_ACCOUNT_NUMBER=99887766\n"
+            "SCHWAB_ACCOUNTS=99887766\n"
             "SCHWAB_DRY_RUN=false\n"
             "SCHWAB_MAX_ORDER_NOTIONAL=250000.0\n"
             "SCHWAB_REQUEST_TIMEOUT_MS=3000\n"
@@ -124,7 +124,7 @@ TEST_CASE("Config loading from string (.env parser)", "[config]") {
         CHECK(cfg.callback_url == "https://127.0.0.1/auth");
         CHECK(cfg.base_url == "https://api.schwabapi.com");
         CHECK(cfg.token_path == ".my_tokens.json");
-        CHECK(cfg.target_account_number == "99887766");
+        CHECK(cfg.accounts == "99887766");
         CHECK(cfg.execution.dry_run == false);
         CHECK(cfg.execution.max_order_notional == 250000.0);
         CHECK(cfg.execution.request_timeout_ms == 3000);
@@ -134,6 +134,16 @@ TEST_CASE("Config loading from string (.env parser)", "[config]") {
         CHECK(cfg.get_int("WINDOW_SIZE", 0) == 100);
         CHECK(cfg.get_string("BENCHMARK_SYMBOL") == "SPY");
         CHECK(cfg.is_valid());
+    }
+
+    SECTION("SCHWAB_ACCOUNTS consolidates account configuration") {
+        std::string_view env = "SCHWAB_ACCOUNTS=all\n";
+        Config cfg = Config::load_from_string(env);
+        CHECK(cfg.accounts == "all");
+
+        std::string_view env_list = "SCHWAB_ACCOUNTS=1234,5678\n";
+        Config cfg_list = Config::load_from_string(env_list);
+        CHECK(cfg_list.accounts == "1234,5678");
     }
 
     SECTION("Malformed lines and empty input handled gracefully") {

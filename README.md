@@ -64,7 +64,7 @@ Run the automated one-click build and test runner:
 ```cmd
 run_tests.bat
 ```
-*(All 797 Catch2 assertions across 72 test cases execute in ~0.4s).*
+*(All 1,317 Catch2 assertions across 102 test cases execute in ~0.5s).*
 
 ### 3. Configure Credentials
 Copy the environment template and populate your Schwab Developer portal credentials:
@@ -77,7 +77,7 @@ Configure `.env`:
 SCHWAB_APP_KEY=YOUR_APP_KEY
 SCHWAB_APP_SECRET=YOUR_APP_SECRET
 SCHWAB_CALLBACK_URL=https://127.0.0.1
-SCHWAB_ACCOUNT_NUMBER=YOUR_ENCRYPTED_ACCOUNT_HASH
+SCHWAB_ACCOUNTS=all
 SCHWAB_DRY_RUN=true
 ```
 
@@ -91,7 +91,7 @@ Follow the prompt, log in via your browser, and paste the redirect URL to save t
 ### 5. Run Immediate Simulation
 Execute a dry-run pass with full ASCII telemetry:
 ```powershell
-.\build\Debug\schwab_executor.exe execute --dry-run
+.\build\Debug\schwab_executor.exe execute --dry-run --accounts all
 ```
 
 ---
@@ -108,8 +108,11 @@ schwab_executor auth
 # Inspect token TTLs, pre-baked auth header, and account balances
 schwab_executor status
 
-# Evaluate strategy and execute orders immediately
-schwab_executor execute [--dry-run] [--config <path>] [--telemetry-log <path>]
+# Validate orders with live broker margin engines without execution
+schwab_executor execute --preview --accounts all
+
+# Evaluate strategy and execute orders immediately across all linked accounts
+schwab_executor execute [--dry-run] [--preview] [--accounts <filter>] [--config <path>] [--telemetry-log <path>]
 ```
 
 ### Command Summary
@@ -125,9 +128,12 @@ schwab_executor execute [--dry-run] [--config <path>] [--telemetry-log <path>]
 | Option / Flag | Description |
 | :--- | :--- |
 | `--dry-run` | Forces simulation mode without sending live broker orders. |
+| `--preview` | Validates orders against live Schwab margin/order engine (`/previewOrder`) without submitting. |
+| `--accounts <filter>` | Multi-account filter: `"all"`, comma-separated numbers/hashes, or last 4 digits (e.g. `1234,5678`). |
 | `--account-hash <hash>` | Overrides the target Schwab encrypted account hash. |
 | `--config <path>` | Path to `.env` configuration file (default: `.env`). |
 | `--token-path <path>` | Path to OAuth token JSON cache (default: `.schwab_token.json`). |
+| `--track-fills` | Polls broker post-dispatch to verify fills and calculate execution slippage. |
 | `--telemetry-log <path>` | Appends execution reports to a persistent log file. |
 | `--help`, `-h` | Displays usage and command reference. |
 

@@ -153,8 +153,8 @@ Config Config::load_from_string(std::string_view content) {
             cfg.base_url = std::string(val);
         } else if (key == "SCHWAB_TOKEN_PATH") {
             cfg.token_path = std::filesystem::path(val);
-        } else if (key == "SCHWAB_ACCOUNT_NUMBER") {
-            cfg.target_account_number = std::string(val);
+        } else if (key == "SCHWAB_ACCOUNTS") {
+            cfg.accounts = std::string(val);
         } else if (key == "SCHWAB_DRY_RUN") {
             cfg.execution.dry_run = (iequals(val, "true") || iequals(val, "1") || iequals(val, "yes") || iequals(val, "on"));
         } else if (key == "SCHWAB_MAX_ORDER_NOTIONAL") {
@@ -197,8 +197,8 @@ void Config::apply_environment_overrides() {
     if (const char* v = check_env("SCHWAB_TOKEN_PATH")) {
         token_path = std::filesystem::path(v);
     }
-    if (const char* v = check_env("SCHWAB_ACCOUNT_NUMBER")) {
-        target_account_number = v;
+    if (const char* v = check_env("SCHWAB_ACCOUNTS")) {
+        accounts = v;
     }
     if (const char* v = check_env("SCHWAB_DRY_RUN")) {
         std::string_view sv(v);
