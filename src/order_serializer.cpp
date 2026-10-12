@@ -58,7 +58,7 @@ bool OrderSerializer::serialize_order(const Order& order, std::string& out_buffe
     out_buffer.append(to_string(order.side));
     out_buffer.append("\",\"quantity\":"sv);
 
-    // Quantity (integer if whole number within 2^53 safe int range, otherwise floating point)
+    // Quantity (integer if whole number within 2^53 safe int range, otherwise floating point up to 4 decimal places)
     char qty_buf[32];
     constexpr double kMaxExactInt = 9007199254740992.0; // 2^53 max exact int in IEEE 754 double
     if (order.quantity < kMaxExactInt && order.quantity == std::floor(order.quantity)) {
@@ -69,9 +69,22 @@ bool OrderSerializer::serialize_order(const Order& order, std::string& out_buffe
             return false;
         }
     } else {
-        auto [q_ptr, q_ec] = std::to_chars(qty_buf, qty_buf + sizeof(qty_buf), order.quantity);
+        // Schwab equity rule: Quantity must have at most 15 digits and 4 decimal places
+        double rounded_qty = std::round(order.quantity * 10000.0) / 10000.0;
+        auto [q_ptr, q_ec] = std::to_chars(qty_buf, qty_buf + sizeof(qty_buf), rounded_qty, std::chars_format::fixed, 4);
         if (q_ec == std::errc()) [[likely]] {
-            out_buffer.append(qty_buf, static_cast<size_t>(q_ptr - qty_buf));
+            // Trim trailing zeros after decimal point for clean wire JSON (e.g. 1.5000 -> 1.5)
+            char* end_ptr = q_ptr;
+            char* dot_ptr = std::find(qty_buf, end_ptr, '.');
+            if (dot_ptr != end_ptr) {
+                while (end_ptr > dot_ptr + 1 && *(end_ptr - 1) == '0') {
+                    --end_ptr;
+                }
+                if (end_ptr == dot_ptr + 1) {
+                    --end_ptr;
+                }
+            }
+            out_buffer.append(qty_buf, static_cast<size_t>(end_ptr - qty_buf));
         } else [[unlikely]] {
             return false;
         }
@@ -131,40 +144,43 @@ std::string OrderSerializer::parse_error_message(const HttpResponse& response) {
 
     auto j = nlohmann::json::parse(response.body, nullptr, false);
     if (!j.is_discarded() && j.is_object()) {
-        // OAuth and Schwab API error format: "error" + "error_description"
-        if (j.contains("error_description") && j["error_description"].is_string()) {
-            std::string desc = j["error_description"].get<std::string>();
-            if (j.contains("error") && j["error"].is_string()) {
-                return j["error"].get<std::string>() + ": " + desc;
-            }
-            return desc;
-        }
-        if (j.contains("description") && j["description"].is_string()) {
-            std::string desc = j["description"].get<std::string>();
-            if (j.contains("error") && j["error"].is_string()) {
-                return j["error"].get<std::string>() + ": " + desc;
-            }
-            return desc;
-        }
-        if (j.contains("message") && j["message"].is_string()) {
-            return j["message"].get<std::string>();
-        }
-        if (j.contains("error") && j["error"].is_string()) {
-            return j["error"].get<std::string>();
-        }
+        std::string err_details;
         if (j.contains("errors") && j["errors"].is_array()) {
-            std::string combined;
             for (const auto& item : j["errors"]) {
                 if (item.is_string()) {
-                    if (!combined.empty()) {
-                        combined.append(", ");
+                    if (!err_details.empty()) {
+                        err_details.append(", ");
                     }
-                    combined.append(item.get<std::string>());
+                    err_details.append(item.get<std::string>());
                 }
             }
-            if (!combined.empty()) {
-                return combined;
+        }
+
+        std::string primary_msg;
+        if (j.contains("error_description") && j["error_description"].is_string()) {
+            primary_msg = j["error_description"].get<std::string>();
+            if (j.contains("error") && j["error"].is_string()) {
+                primary_msg = j["error"].get<std::string>() + ": " + primary_msg;
             }
+        } else if (j.contains("description") && j["description"].is_string()) {
+            primary_msg = j["description"].get<std::string>();
+            if (j.contains("error") && j["error"].is_string()) {
+                primary_msg = j["error"].get<std::string>() + ": " + primary_msg;
+            }
+        } else if (j.contains("message") && j["message"].is_string()) {
+            primary_msg = j["message"].get<std::string>();
+        } else if (j.contains("error") && j["error"].is_string()) {
+            primary_msg = j["error"].get<std::string>();
+        }
+
+        if (!primary_msg.empty() && !err_details.empty()) {
+            return primary_msg + ": " + err_details;
+        }
+        if (!err_details.empty()) {
+            return err_details;
+        }
+        if (!primary_msg.empty()) {
+            return primary_msg;
         }
     }
 

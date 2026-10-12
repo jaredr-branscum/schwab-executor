@@ -31,7 +31,7 @@ void ExecutionDriver::update_endpoint_path() {
     endpoint_path_.reserve(128);
     endpoint_path_.append("/trader/v1/accounts/"sv);
     endpoint_path_.append(config_.account_hash);
-    endpoint_path_.append("/orders"sv);
+    endpoint_path_.append(config_.preview_only ? "/previewOrder"sv : "/orders"sv);
 }
 
 OrderExecutionResult ExecutionDriver::execute_single_order(
@@ -93,11 +93,12 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
     result.http_status = resp.status_code;
     result.latency = resp.latency;
 
-    // Schwab returns HTTP 201 Created on successful order placement
-    if (resp.status_code == 201) {
+    // Schwab returns HTTP 201 Created on successful order placement, or HTTP 200 OK on previewOrder
+    const bool is_accepted = (config_.preview_only && resp.status_code == 200) || (resp.status_code == 201);
+    if (is_accepted) {
         result.success = true;
-        result.order.status = OrderStatus::PendingSubmit;
-        result.order_id = OrderSerializer::extract_order_id(resp);
+        result.order.status = config_.preview_only ? OrderStatus::New : OrderStatus::PendingSubmit;
+        result.order_id = config_.preview_only ? "PREVIEW_VALIDATED" : OrderSerializer::extract_order_id(resp);
     } else {
         result.success = false;
         result.order.status = OrderStatus::Rejected;

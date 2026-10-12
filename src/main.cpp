@@ -27,6 +27,7 @@ void print_help() noexcept {
               << "  help     Display this help message\n\n"
               << "Options:\n"
               << "  --dry-run              Force simulation mode (does not submit live broker orders)\n"
+              << "  --preview              Validate orders against live Schwab margin/order engine (/previewOrder) without executing\n"
               << "  --account-hash <hash>  Schwab encrypted account hash override\n"
               << "  --config <path>        Path to .env configuration file (default: .env)\n"
               << "  --token-path <path>    Path to .schwab_token.json (default: .schwab_token.json)\n"
@@ -36,6 +37,7 @@ void print_help() noexcept {
               << "Examples:\n"
               << "  schwab_executor status\n"
               << "  schwab_executor execute --dry-run\n"
+              << "  schwab_executor execute --preview\n"
               << "  schwab_executor execute\n"
               << "================================================================================\n\n";
 }
@@ -159,6 +161,7 @@ int main(int argc, char* argv[]) {
     std::string_view account_hash_str = "";
     std::string_view telemetry_log_str = "";
     bool force_dry_run = false;
+    bool force_preview = false;
     bool force_track_fills = false;
 
     // Zero-allocation CLI argument parsing using string_view slices
@@ -179,6 +182,8 @@ int main(int argc, char* argv[]) {
             telemetry_log_str = argv[++i];
         } else if (arg == "--dry-run") {
             force_dry_run = true;
+        } else if (arg == "--preview") {
+            force_preview = true;
         } else if (arg == "--track-fills") {
             force_track_fills = true;
         } else if (arg == "auth" || arg == "status" || arg == "execute") {
@@ -208,6 +213,10 @@ int main(int argc, char* argv[]) {
         }
         if (force_dry_run) {
             exec_cfg.dry_run = true;
+        }
+        if (force_preview) {
+            exec_cfg.preview_only = true;
+            exec_cfg.dry_run = false;
         }
         if (force_track_fills) {
             exec_cfg.track_fills = true;

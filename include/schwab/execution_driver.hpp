@@ -42,6 +42,7 @@ struct ExecutionReport {
 struct ExecutionDriverConfig {
     std::string account_hash;              // Schwab encrypted account hash
     bool dry_run{false};                   // If true, validates and serializes without network I/O
+    bool preview_only{false};             // If true, validates orders via /previewOrder without live placement
     bool stop_on_auth_failure{true};       // If true, halts batch execution immediately if 401/403 is encountered
     bool abort_buys_on_sell_failure{true}; // If true, halts execution before dispatching buys if any sell submission failed
 };

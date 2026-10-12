@@ -24,12 +24,14 @@ ExecutionRunner::ExecutionRunner(ExecutionConfig config, std::shared_ptr<IStrate
 
 std::string ExecutionRunner::format_telemetry_table(
     const ExecutionReport& report,
-    bool is_dry_run
+    bool is_dry_run,
+    bool is_preview
 ) {
     std::ostringstream ss;
 
     ss << "\n================================================================================================================\n"
-       << "  [SCHWAB-EXECUTOR] " << (is_dry_run ? "SIMULATION TELEMETRY (DRY RUN)" : "LIVE BROKER EXECUTION REPORT") << "\n"
+       << "  [SCHWAB-EXECUTOR] "
+       << (is_preview ? "BROKER ORDER PREVIEW VALIDATION (/previewOrder)" : (is_dry_run ? "SIMULATION TELEMETRY (DRY RUN)" : "LIVE BROKER EXECUTION REPORT")) << "\n"
        << "================================================================================================================\n"
        << "  " << std::left 
        << std::setw(6)  << "SIDE"
@@ -48,8 +50,10 @@ std::string ExecutionRunner::format_telemetry_table(
         std::string sym_str(res.order.symbol.view());
         std::string tag_str = res.order.tag.empty() ? "-" : std::string(res.order.tag.view());
         std::string type_str(to_string(res.order.type));
-        std::string status_str = res.success ? (is_dry_run ? "SIMULATED" : "FILLED/STAGED") : "FAILED";
-        std::string id_str = res.order_id.value_or(is_dry_run ? "DRY_RUN_ID" : "-");
+        std::string status_str = res.success 
+            ? (is_preview ? "PREVIEW_OK" : (is_dry_run ? "SIMULATED" : "FILLED/STAGED")) 
+            : "FAILED";
+        std::string id_str = res.order_id.value_or(is_preview ? "PREVIEW_VALIDATED" : (is_dry_run ? "DRY_RUN_ID" : "-"));
 
         std::ostringstream qty_stream;
         qty_stream << std::fixed << std::setprecision(2) << res.order.quantity;
@@ -275,12 +279,13 @@ int ExecutionRunner::execute(
               << "================================================================================\n"
               << "  * Mode               : [" << config_.session_name << "]\n"
               << "  * Strategy Model     : [" << strategy_->name() << "]\n"
-              << "  * Execution Target   : " << (config_.dry_run ? "[SIMULATION - DRY RUN]" : "[LIVE BROKER ORDERS]") << "\n";
+              << "  * Execution Target   : " 
+              << (config_.preview_only ? "[BROKER PREVIEW - NO EXECUTION]" : (config_.dry_run ? "[SIMULATION - DRY RUN]" : "[LIVE BROKER ORDERS]")) << "\n";
 
     Config cfg = Config::load_from_file(config_.config_path);
 
     // Override dry_run from config if not explicitly set via CLI
-    if (!config_.dry_run && cfg.execution.dry_run) {
+    if (!config_.dry_run && !config_.preview_only && cfg.execution.dry_run) {
         config_.dry_run = true;
     }
 
@@ -299,19 +304,20 @@ int ExecutionRunner::execute(
     if (account_hash.empty()) {
         account_hash = cfg.target_account_number;
     }
-    if (account_hash.empty() && config_.dry_run) {
+    if (account_hash.empty() && config_.dry_run && !config_.preview_only) {
         account_hash = "SIMULATED_ACCOUNT";
     }
 
-    if (account_hash.empty() && !config_.dry_run) {
-        std::cerr << "  * Error: Target account hash is required for live execution.\n"
+    if (account_hash.empty() && (!config_.dry_run || config_.preview_only)) {
+        std::cerr << "  * Error: Target account hash is required for "
+                  << (config_.preview_only ? "broker preview validation.\n" : "live execution.\n")
                   << "    Set SCHWAB_ACCOUNT_NUMBER in .env or provide --account-hash <hash>.\n\n";
         return 1;
     }
 
     // Ensure active OAuth session
     std::string access_token;
-    if (config_.dry_run) {
+    if (config_.dry_run && !config_.preview_only) {
         auto token_opt = TokenManager::load_from_file(config_.token_path);
         if (token_opt.has_value() && !token_opt->is_access_token_expired()) {
             access_token = token_opt->access_token;
@@ -391,7 +397,7 @@ int ExecutionRunner::execute(
     limits.max_order_notional = cfg.execution.max_order_notional;
     limits.price_collar_percent = cfg.get_double("SCHWAB_PRICE_COLLAR_PERCENT", 0.05);
     limits.max_bid_ask_spread_bps = cfg.get_double("SCHWAB_MAX_SPREAD_BPS", 50.0);
-    limits.enforce_moc_cutoff = !config_.dry_run;
+    limits.enforce_moc_cutoff = !config_.dry_run && !config_.preview_only;
     limits.dry_run = false; // Allow plan generation; ExecutionDriver handles dry-run simulation
     limits.reject_crossed_book = true;
     RiskGuard risk_guard(limits);
@@ -526,7 +532,7 @@ int ExecutionRunner::execute(
     }
 
     // Pre-warm HTTP transport and Dispatch Rebalance Plan
-    if (!config_.dry_run && !http_client_.is_connected()) {
+    if ((!config_.dry_run || config_.preview_only) && !http_client_.is_connected()) {
         http_client_.prewarm();
     }
 
@@ -535,7 +541,8 @@ int ExecutionRunner::execute(
 
     ExecutionDriverConfig driver_cfg;
     driver_cfg.account_hash = account_hash;
-    driver_cfg.dry_run = config_.dry_run;
+    driver_cfg.dry_run = config_.dry_run && !config_.preview_only;
+    driver_cfg.preview_only = config_.preview_only;
     driver_cfg.stop_on_auth_failure = true;
     driver_cfg.abort_buys_on_sell_failure = true;
 
@@ -548,7 +555,7 @@ int ExecutionRunner::execute(
     }
 
     // Output Formatted Telemetry Table and Save to History/File
-    std::string table_str = format_telemetry_table(report, config_.dry_run);
+    std::string table_str = format_telemetry_table(report, config_.dry_run, config_.preview_only);
     std::cout << table_str;
 
     execution_history_.push_back(report);
@@ -558,7 +565,7 @@ int ExecutionRunner::execute(
     }
 
     std::string recon_table_str;
-    if (config_.track_fills && report.total_succeeded > 0) {
+    if (config_.track_fills && report.total_succeeded > 0 && !config_.preview_only) {
         if (!config_.dry_run) {
             std::cout << "  * Order Tracking     : Reconciling post-dispatch fills with Charles Schwab...\n";
             OrderTrackerConfig tracker_cfg;

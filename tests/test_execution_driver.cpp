@@ -366,4 +366,45 @@ TEST_CASE("ExecutionDriver runtime atomic abort on sell failure", "[execution_dr
     CHECK(report.results[1].error_message.find("atomic abort") != std::string::npos);
 }
 
+TEST_CASE("ExecutionDriver broker previewOrder validation", "[execution_driver]") {
+    auto mock = std::make_unique<MockTransport>();
+    MockTransport* raw_mock = mock.get();
+
+    raw_mock->handler = [](const HttpRequest& req) {
+        REQUIRE(req.path == "/trader/v1/accounts/PREVIEW_HASH/previewOrder");
+        REQUIRE(req.method == HttpMethod::Post);
+        REQUIRE(req.auth_header == "Bearer token_abc");
+
+        HttpResponse r;
+        r.status_code = 200; // Schwab returns 200 OK for previewOrder
+        r.body = "{\"orderId\":0,\"orderStrategy\":{\"accountNumber\":\"12345\"}}";
+        r.latency = std::chrono::microseconds{180};
+        return r;
+    };
+
+    HttpClient client(std::move(mock));
+    ExecutionDriver driver(client, ExecutionDriverConfig{
+        .account_hash = "PREVIEW_HASH",
+        .dry_run = false,
+        .preview_only = true
+    });
+
+    RebalancePlan plan;
+    Order ord;
+    ord.symbol = Symbol{"SPY"};
+    ord.side = OrderSide::Buy;
+    ord.quantity = 15.0;
+    plan.orders = {ord};
+
+    ExecutionReport report = driver.execute_plan(plan, "token_abc");
+
+    REQUIRE(report.all_succeeded);
+    REQUIRE(report.total_submitted == 1);
+    REQUIRE(report.total_succeeded == 1);
+    REQUIRE(report.results[0].http_status == 200);
+    REQUIRE(report.results[0].order_id == "PREVIEW_VALIDATED");
+    REQUIRE(report.results[0].order.status == OrderStatus::New);
+    REQUIRE(raw_mock->send_count == 1);
+}
+
 

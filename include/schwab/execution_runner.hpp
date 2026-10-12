@@ -28,6 +28,7 @@ namespace schwab {
  */
 struct ExecutionConfig {
     bool dry_run{true};                             ///< Safety simulation mode (defaults to .env, overridden by --dry-run)
+    bool preview_only{false};                       ///< Broker-side validation mode via /previewOrder (no execution)
     std::filesystem::path config_path{".env"};
     std::filesystem::path token_path{".schwab_token.json"};
     std::string account_hash_override{};
@@ -66,7 +67,8 @@ public:
      */
     [[nodiscard]] static std::string format_telemetry_table(
         const ExecutionReport& report,
-        bool is_dry_run
+        bool is_dry_run,
+        bool is_preview = false
     );
 
     /**
