@@ -170,8 +170,8 @@ When invoked, the engine completes the following sequence:
 Immediate execution is ideal for external schedulers. To run rebalancing every weekday at 3:59 PM:
 ```powershell
 # Create a Windows Scheduled Task for 3:59 PM Mon-Fri
-$Action = New-ScheduledTaskAction -Execute "build\Debug\schwab_executor.exe" `
-                                  -Argument "execute --telemetry-log logs\execution_telemetry.log" `
+$Action = New-ScheduledTaskAction -Execute "build\Release\schwab_executor.exe" `
+                                  -Argument "execute --telemetry-log logs/execution_telemetry.log" `
                                   -WorkingDirectory (Get-Location).Path
 $Trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 3:59PM
 Register-ScheduledTask -TaskName "SchwabExecutorDailyMOC" -Action $Action -Trigger $Trigger -Description "Daily Schwab Rebalance"

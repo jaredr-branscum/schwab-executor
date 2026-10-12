@@ -59,12 +59,65 @@ High-performance, ultra-low-latency execution engine engineered in C++20 for Cha
 - **Build Tool:** CMake 3.20+
 - **Python:** Python 3.10+ (Standard library only; zero pip dependencies)
 
-### 2. Build & Test
-Run the automated one-click build and test runner:
+### 2. Build & Test Instructions
+
+The engine provides automated build scripts alongside direct CMake command-line support.
+
+#### Option A: Automated Build Script (`build.bat`)
+Run the one-click Windows MSVC/CMake build utility:
 ```cmd
-run_tests.bat
+# Build optimized Release configuration (default, recommended for production)
+build.bat
+
+# Or select specific configurations / actions:
+build.bat Release       # Compiles optimized Release binary (AVX2, inlined hot paths)
+build.bat Debug         # Compiles Debug binary with debug symbols
+build.bat all           # Compiles both Debug and Release configurations
+build.bat clean         # Purges build/ directory and compiles completely fresh
+build.bat test          # Compiles and runs the full Catch2 unit test suite
 ```
-*(All 1,317 Catch2 assertions across 102 test cases execute in ~0.5s).*
+
+#### Option B: Unit Test Suite Runner (`run_tests.bat`)
+Execute the Catch2 unit test suite across all 102 test cases (1,334 assertions):
+```cmd
+run_tests.bat           # Compiles and runs tests in Debug mode
+run_tests.bat Release   # Compiles and runs tests in Release mode
+```
+*(All 1,334 Catch2 assertions execute in ~0.5s with zero warnings).*
+
+#### Option C: Direct CMake Commands (Manual Workflow)
+For customized developer environments or CI/CD pipelines:
+```powershell
+# 1. Configure CMake build system
+cmake -B build -S .
+
+# 2. Compile target configuration (multi-core parallel build)
+cmake --build build --config Release --parallel
+# Or for Debug:
+cmake --build build --config Debug --parallel
+
+# 3. Run Catch2 test harness
+ctest --test-dir build -C Release --output-on-failure
+# Or invoke the test executable directly:
+.\build\tests\Release\run_unit_tests.exe
+
+# 4. Clean rebuild
+cmake --build build --target clean
+# Or delete the build tree and reconfigure:
+rmdir /s /q build
+cmake -B build -S .
+cmake --build build --config Release --parallel
+```
+
+#### Generated Artifacts & Build Layout
+| Artifact Path | Target Type | Description |
+| :--- | :--- | :--- |
+| `build\Release\schwab_executor.exe` | CLI Executable | Optimized production CLI (sub-millisecond latency, AVX2 enabled) |
+| `build\Debug\schwab_executor.exe` | CLI Executable | Development CLI with debug symbols for debugging |
+| `build\Release\schwab_core.lib` | Static Library | Institutional execution engine core linked by external strategy modules |
+| `build\tests\Release\run_unit_tests.exe` | Test Suite | Catch2 test suite (102 test cases, 1,334 assertions) |
+
+---
 
 ### 3. Configure Credentials
 Copy the environment template and populate your Schwab Developer portal credentials:
@@ -84,14 +137,15 @@ SCHWAB_DRY_RUN=true
 ### 4. Authenticate OAuth 2.0 Session
 Launch the interactive authenticator:
 ```powershell
-.\build\Debug\schwab_executor.exe auth
+.\build\Release\schwab_executor.exe auth
 ```
+*(Note: You can also use `.\build\Debug\schwab_executor.exe auth` during development).*
 Follow the prompt, log in via your browser, and paste the redirect URL to save tokens atomically to `.schwab_token.json`.
 
 ### 5. Run Immediate Simulation
 Execute a dry-run pass with full ASCII telemetry:
 ```powershell
-.\build\Debug\schwab_executor.exe execute --dry-run --accounts all
+.\build\Release\schwab_executor.exe execute --dry-run --accounts all
 ```
 
 ---

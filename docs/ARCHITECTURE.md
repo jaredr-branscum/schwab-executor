@@ -112,6 +112,7 @@ Before any order is staged or transmitted, [`RiskGuard`](../include/schwab/risk_
 ```text
 schwab-executor/
 ├── CMakeLists.txt                 # Modern C++20 build definition (MSVC / Clang / GCC)
+├── build.bat                      # 1-click build script (Release / Debug / clean / test)
 ├── run_tests.bat                  # 1-click test runner & build script (Windows)
 ├── .env.example                   # Environment configuration template
 ├── .env                           # Local configuration (secrets, ignored by git)
