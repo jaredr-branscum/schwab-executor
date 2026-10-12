@@ -20,7 +20,8 @@ enum class RiskRejectReason : uint8_t {
     MocCutoffExceeded,
     DryRunIntercepted,
     CrossedBookAnomaly,
-    MaxSpreadExceeded
+    MaxSpreadExceeded,
+    ExceedsAvailableCash
 };
 
 // Zero-allocation string representation for reject reasons
@@ -36,6 +37,7 @@ enum class RiskRejectReason : uint8_t {
         case RiskRejectReason::DryRunIntercepted: return "DRY_RUN_INTERCEPTED";
         case RiskRejectReason::CrossedBookAnomaly: return "CROSSED_BOOK_ANOMALY";
         case RiskRejectReason::MaxSpreadExceeded: return "MAX_SPREAD_EXCEEDED";
+        case RiskRejectReason::ExceedsAvailableCash: return "EXCEEDS_AVAILABLE_CASH";
     }
     return "UNKNOWN";
 }
@@ -64,6 +66,8 @@ struct RiskLimits {
     bool enforce_moc_cutoff{true};              // Enforce exchange MOC cutoff deadline (offset 44)
     bool dry_run{false};                        // Intercept orders when dry-run is active (offset 45)
     bool reject_crossed_book{true};             // Reject orders when NBBO is crossed (offset 46)
+    bool enforce_cash_limits{true};             // Enforce that aggregate buy commitments <= cash + sell proceeds (offset 47)
+    bool allow_margin_borrowing{false};         // Prohibit unintended margin debt by default (offset 48)
 };
 static_assert(sizeof(RiskLimits) <= 64, "RiskLimits must fit within single 64-byte CPU cache line");
 
@@ -355,6 +359,37 @@ public:
         }
 
         // All Pre-Trade Risk Gates Passed
+        return RiskCheckResult{
+            .approved = true,
+            .reason = RiskRejectReason::None,
+            .message = "Approved"
+        };
+    }
+
+    /// @brief Evaluates aggregate buy commitment against available cash purchasing power (inlined on hot path)
+    /// @param total_buy_commitment Total dollar commitment of all staged buy orders at limit/mark prices
+    /// @param total_available_cash Total available cash including proceeds from approved sell orders
+    /// @return RiskCheckResult indicating approval or rejection reason
+    [[nodiscard]] inline RiskCheckResult validate_cash_commitment(
+        double total_buy_commitment,
+        double total_available_cash
+    ) const noexcept {
+        if (!limits_.enforce_cash_limits || limits_.allow_margin_borrowing) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = true,
+                .reason = RiskRejectReason::None,
+                .message = "Approved"
+            };
+        }
+
+        if (total_buy_commitment > total_available_cash + 0.01) [[unlikely]] {
+            return RiskCheckResult{
+                .approved = false,
+                .reason = RiskRejectReason::ExceedsAvailableCash,
+                .message = "Aggregate buy commitments exceed available purchasing power (unintended margin borrowing disallowed)"
+            };
+        }
+
         return RiskCheckResult{
             .approved = true,
             .reason = RiskRejectReason::None,

@@ -39,6 +39,8 @@ struct ExecutionConfig {
     bool track_fills{false};                        ///< If true, polls orders to terminal state post-dispatch (live only)
     uint32_t fill_poll_interval_ms{100};            ///< Polling interval in ms for fill reconciliation
     uint32_t fill_poll_timeout_ms{5000};            ///< Maximum timeout in ms for fill reconciliation
+    bool enforce_cash_limits{true};                 ///< Enforce aggregate buy commitments <= available cash + sell proceeds
+    bool allow_margin_borrowing{false};             ///< If false, blocks buy orders that exceed cash to prevent unintended margin debt
 };
 
 /**

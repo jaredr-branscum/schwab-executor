@@ -514,6 +514,8 @@ int ExecutionRunner::execute(
     limits.enforce_moc_cutoff = !config_.dry_run && !config_.preview_only;
     limits.dry_run = false;
     limits.reject_crossed_book = true;
+    limits.enforce_cash_limits = config_.enforce_cash_limits && cfg.get_bool("SCHWAB_ENFORCE_CASH_LIMITS", true);
+    limits.allow_margin_borrowing = config_.allow_margin_borrowing || cfg.get_bool("SCHWAB_ALLOW_MARGIN_BORROWING", false);
     RiskGuard risk_guard(limits);
 
     auto session_start = std::chrono::steady_clock::now();
@@ -750,6 +752,63 @@ int ExecutionRunner::execute(
                 msg.append(": ");
                 msg.append(check.message);
                 deferred_diagnostics.push_back(std::move(msg));
+            }
+        }
+
+        // PASS 3: Aggregate Cash & Buying Power Gate (Defense-in-Depth)
+        // Ensures total buy commitments at limit/reference prices strictly never exceed available cash + approved sell proceeds.
+        if (risk_guard.limits().enforce_cash_limits && !risk_guard.limits().allow_margin_borrowing) {
+            double total_available_cash = (std::max)(0.0, acc.available_cash());
+            for (const auto& ord : approved_orders) {
+                if (ord.side == OrderSide::Sell) {
+                    double p = 0.0;
+                    if (ord.type == OrderType::Limit && ord.limit_price.has_value() && *ord.limit_price > 0.0) {
+                        p = *ord.limit_price;
+                    } else {
+                        const Quote* q = find_quote(last_market_quotes_, ord.symbol);
+                        if (q != nullptr && q->is_valid()) {
+                            p = (q->bid_price > 0.0) ? q->bid_price : q->reference_price();
+                        } else {
+                            const Position* pos = find_position(acc.positions, ord.symbol);
+                            p = (pos != nullptr && pos->current_price > 0.0) ? pos->current_price : 0.0;
+                        }
+                    }
+                    if (p > 0.0) {
+                        total_available_cash += ord.quantity * p;
+                    }
+                }
+            }
+
+            double total_buy_commitment = 0.0;
+            for (const auto& ord : approved_orders) {
+                if (ord.side == OrderSide::Buy) {
+                    double p = 0.0;
+                    if (ord.type == OrderType::Limit && ord.limit_price.has_value() && *ord.limit_price > 0.0) {
+                        p = *ord.limit_price;
+                    } else {
+                        const Quote* q = find_quote(last_market_quotes_, ord.symbol);
+                        if (q != nullptr && q->is_valid()) {
+                            p = (q->ask_price > 0.0) ? q->ask_price : q->reference_price();
+                        } else {
+                            const Position* pos = find_position(acc.positions, ord.symbol);
+                            p = (pos != nullptr && pos->current_price > 0.0) ? pos->current_price : 0.0;
+                        }
+                    }
+                    total_buy_commitment += ord.quantity * p;
+                }
+            }
+
+            auto cash_check = risk_guard.validate_cash_commitment(total_buy_commitment, total_available_cash);
+            if (!cash_check.approved) [[unlikely]] {
+                char diag_buf[256];
+                std::snprintf(diag_buf, sizeof(diag_buf),
+                    "  * [ATOMIC ABORT] Entire rebalance batch aborted for account %.*s: Aggregate buy commitments ($%.2f) exceed available purchasing power ($%.2f) by $%.2f (unintended margin borrowing blocked)",
+                    static_cast<int>(acc.masked_account_number().size()), acc.masked_account_number().data(),
+                    total_buy_commitment, total_available_cash, total_buy_commitment - total_available_cash);
+                deferred_diagnostics.push_back(std::string(diag_buf));
+
+                // Atomic Batch Abort: drop all orders (sells and buys) to preserve portfolio state integrity
+                approved_orders.clear();
             }
         }
 

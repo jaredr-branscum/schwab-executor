@@ -725,6 +725,81 @@ TEST_CASE("ExecutionRunner multi-account batch execution (SCHWAB_ACCOUNTS=all)",
         CHECK_FALSE(summary->account_results[0].success);
         CHECK(summary->account_results[1].success);
     }
+
+    SECTION("Aggregate buy commitment exceeding available cash is blocked by RiskGuard") {
+        class CashBreachStrategy : public IStrategy {
+        public:
+            [[nodiscard]] std::string_view name() const noexcept override { return "CashBreachStrategy"; }
+            [[nodiscard]] std::vector<Order> generate_orders(std::span<const Position>, double) override {
+                // Emits a BUY order that commits $20,000 when available cash is only $10,000
+                Order o;
+                o.symbol = Symbol("SPY");
+                o.side = OrderSide::Buy;
+                o.quantity = 40.0;
+                o.type = OrderType::Limit;
+                o.limit_price = 500.0; // 40 * 500 = $20,000 > $10,000 cash
+                return {o};
+            }
+        };
+
+        AccountPortfolio acc;
+        acc.account_number = "55556666";
+        acc.account_hash = "TEST_HASH_CASH";
+        acc.cash_balance = 10000.0; // $10,000 cash
+
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.enforce_cash_limits = true;
+        cfg.allow_margin_borrowing = false;
+
+        ExecutionRunner runner(cfg, std::make_shared<CashBreachStrategy>());
+        std::vector<AccountPortfolio> test_accounts = {acc};
+        int exit_code = runner.execute({}, std::nullopt, test_accounts);
+
+        // Blocked by RiskGuard cash gate -> exit code non-zero
+        REQUIRE(exit_code != 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->failed_accounts == 1);
+        CHECK(summary->account_results[0].status_notes == "Blocked by RiskGuard");
+    }
+
+    SECTION("Allowing margin borrowing permits buy commitments exceeding cash") {
+        class CashBreachStrategy : public IStrategy {
+        public:
+            [[nodiscard]] std::string_view name() const noexcept override { return "CashBreachStrategy"; }
+            [[nodiscard]] std::vector<Order> generate_orders(std::span<const Position>, double) override {
+                Order o;
+                o.symbol = Symbol("SPY");
+                o.side = OrderSide::Buy;
+                o.quantity = 40.0;
+                o.type = OrderType::Limit;
+                o.limit_price = 500.0; // $20,000
+                return {o};
+            }
+        };
+
+        AccountPortfolio acc;
+        acc.account_number = "55556666";
+        acc.account_hash = "TEST_HASH_CASH";
+        acc.cash_balance = 10000.0; // $10,000 cash
+
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.enforce_cash_limits = true;
+        cfg.allow_margin_borrowing = true; // explicitly permit margin debt
+
+        ExecutionRunner runner(cfg, std::make_shared<CashBreachStrategy>());
+        std::vector<AccountPortfolio> test_accounts = {acc};
+        int exit_code = runner.execute({}, std::nullopt, test_accounts);
+
+        // Allowed -> executes successfully in simulation
+        REQUIRE(exit_code == 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->succeeded_accounts == 1);
+        CHECK(summary->account_results[0].success);
+    }
 }
 
 

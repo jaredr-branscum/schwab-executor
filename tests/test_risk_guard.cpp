@@ -22,6 +22,53 @@ TEST_CASE("RiskRejectReason string representation", "[risk_guard]") {
     CHECK(to_string(RiskRejectReason::DryRunIntercepted) == "DRY_RUN_INTERCEPTED");
     CHECK(to_string(RiskRejectReason::CrossedBookAnomaly) == "CROSSED_BOOK_ANOMALY");
     CHECK(to_string(RiskRejectReason::MaxSpreadExceeded) == "MAX_SPREAD_EXCEEDED");
+    CHECK(to_string(RiskRejectReason::ExceedsAvailableCash) == "EXCEEDS_AVAILABLE_CASH");
+}
+
+TEST_CASE("RiskGuard aggregate cash purchasing power gate", "[risk_guard]") {
+    RiskLimits limits;
+    limits.enforce_cash_limits = true;
+    limits.allow_margin_borrowing = false;
+    RiskGuard guard(limits);
+
+    SECTION("Buy commitment within available cash is approved") {
+        auto res = guard.validate_cash_commitment(10'000.0, 15'000.0);
+        CHECK(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
+
+    SECTION("Buy commitment within floating penny tolerance is approved") {
+        auto res = guard.validate_cash_commitment(10'000.005, 10'000.0);
+        CHECK(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
+
+    SECTION("Buy commitment exceeding available cash is rejected") {
+        auto res = guard.validate_cash_commitment(10'050.0, 10'000.0);
+        CHECK_FALSE(res.approved);
+        CHECK(res.reason == RiskRejectReason::ExceedsAvailableCash);
+        CHECK(res.message.find("unintended margin borrowing") != std::string_view::npos);
+    }
+
+    SECTION("Margin borrowing allowed permits cash overage") {
+        RiskLimits margin_limits = limits;
+        margin_limits.allow_margin_borrowing = true;
+        RiskGuard margin_guard(margin_limits);
+
+        auto res = margin_guard.validate_cash_commitment(50'000.0, 10'000.0);
+        CHECK(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
+
+    SECTION("Disabled cash enforcement permits cash overage") {
+        RiskLimits unenforced_limits = limits;
+        unenforced_limits.enforce_cash_limits = false;
+        RiskGuard unenforced_guard(unenforced_limits);
+
+        auto res = unenforced_guard.validate_cash_commitment(50'000.0, 10'000.0);
+        CHECK(res.approved);
+        CHECK(res.reason == RiskRejectReason::None);
+    }
 }
 
 TEST_CASE("RiskGuard nominal approval", "[risk_guard]") {
