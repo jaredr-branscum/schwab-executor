@@ -12,6 +12,7 @@ out/
 # Secrets and tokens
 .env
 .schwab_token*.json
+schwab_token*.json
 *.log
 
 # Python cache

@@ -42,14 +42,17 @@ OAUTH_TOKEN_PATH = "/v1/oauth/token"
 
 
 class SchwabAuth:
-    def __init__(self, env_file: Path = Path(".env")):
+    def __init__(self, env_file: Path = Path(".env"), token_path: Path = None):
         env = load_env(env_file)
         # Fall back to OS environment variables if not in .env
         self.app_key = env.get("SCHWAB_APP_KEY") or os.environ.get("SCHWAB_APP_KEY", "")
         self.app_secret = env.get("SCHWAB_APP_SECRET") or os.environ.get("SCHWAB_APP_SECRET", "")
         self.callback_url = env.get("SCHWAB_CALLBACK_URL") or os.environ.get("SCHWAB_CALLBACK_URL", DEFAULT_CALLBACK_URL)
-        token_str = env.get("SCHWAB_TOKEN_PATH") or os.environ.get("SCHWAB_TOKEN_PATH", DEFAULT_TOKEN_PATH)
-        self.token_path = Path(token_str)
+        if token_path is not None:
+            self.token_path = Path(token_path)
+        else:
+            token_str = env.get("SCHWAB_TOKEN_PATH") or os.environ.get("SCHWAB_TOKEN_PATH", DEFAULT_TOKEN_PATH)
+            self.token_path = Path(token_str)
         self.base_url = (env.get("SCHWAB_BASE_URL") or os.environ.get("SCHWAB_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
 
     def get_authorization_url(self) -> str:
@@ -206,9 +209,11 @@ def main() -> int:
     parser.add_argument("--refresh", action="store_true", help="Refresh access token")
     parser.add_argument("--get-access-token", action="store_true", help="Print valid Bearer access token string")
     parser.add_argument("--env", type=str, default=".env", help="Path to .env configuration file")
+    parser.add_argument("--token-path", type=str, default=None, help="Path to token cache file")
 
     args = parser.parse_args()
-    auth = SchwabAuth(env_file=Path(args.env))
+    token_arg = Path(args.token_path) if args.token_path else None
+    auth = SchwabAuth(env_file=Path(args.env), token_path=token_arg)
 
     if args.check:
         if auth.is_authenticated():

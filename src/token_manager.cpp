@@ -38,15 +38,58 @@ std::optional<OAuthToken> TokenManager::load_from_json(std::string_view json_con
     }
 }
 
-std::optional<OAuthToken> TokenManager::load_from_file(const std::filesystem::path& path) {
+namespace {
+
+[[nodiscard]] std::filesystem::path resolve_token_file(const std::filesystem::path& path) {
     std::error_code ec;
-    if (!std::filesystem::exists(path, ec) || !std::filesystem::is_regular_file(path, ec)) {
+    if (std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec)) {
+        return path;
+    }
+
+    // Search sibling repository path (e.g. ../schwab-executor/.schwab_token.json)
+    if (path.is_relative()) {
+        std::filesystem::path sibling = std::filesystem::path("..") / "schwab-executor" / path;
+        if (std::filesystem::exists(sibling, ec) && std::filesystem::is_regular_file(sibling, ec)) {
+            return sibling;
+        }
+    }
+
+    return path;
+}
+
+[[nodiscard]] std::string resolve_auth_script(const std::string& script) {
+    std::error_code ec;
+    if (std::filesystem::exists(script, ec) && std::filesystem::is_regular_file(script, ec)) {
+        return script;
+    }
+
+    // Check sibling repository: ../schwab-executor/python/auth_cli.py
+    std::filesystem::path sibling = std::filesystem::path("..") / "schwab-executor" / script;
+    if (std::filesystem::exists(sibling, ec) && std::filesystem::is_regular_file(sibling, ec)) {
+        return sibling.string();
+    }
+
+    // Check ../python/auth_cli.py
+    std::filesystem::path parent = std::filesystem::path("..") / script;
+    if (std::filesystem::exists(parent, ec) && std::filesystem::is_regular_file(parent, ec)) {
+        return parent.string();
+    }
+
+    return script;
+}
+
+} // namespace
+
+std::optional<OAuthToken> TokenManager::load_from_file(const std::filesystem::path& path) {
+    std::filesystem::path actual_path = resolve_token_file(path);
+    std::error_code ec;
+    if (!std::filesystem::exists(actual_path, ec) || !std::filesystem::is_regular_file(actual_path, ec)) {
         return std::nullopt;
     }
 
-    std::ifstream file(path, std::ios::in | std::ios::binary);
+    std::ifstream file(actual_path, std::ios::in | std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[ERROR] Unable to open token file: " << path.string() << "\n";
+        std::cerr << "[ERROR] Unable to open token file: " << actual_path.string() << "\n";
         return std::nullopt;
     }
 
@@ -67,14 +110,17 @@ std::optional<OAuthToken> TokenManager::ensure_authenticated(
     const std::filesystem::path& path,
     const std::string& python_auth_script
 ) {
-    auto token = load_from_file(path);
+    std::filesystem::path actual_path = resolve_token_file(path);
+    std::string actual_script = resolve_auth_script(python_auth_script);
+
+    auto token = load_from_file(actual_path);
     if (token && !token->is_refresh_token_expired()) {
         // If access token expired but refresh token is valid, attempt auto-refresh
         if (token->is_access_token_expired()) {
-            std::string refresh_cmd = "python " + python_auth_script + " --refresh";
+            std::string refresh_cmd = "python \"" + actual_script + "\" --refresh";
             auto res = ProcessRunner::execute(refresh_cmd);
             if (res.exit_code == 0) {
-                return load_from_file(path);
+                return load_from_file(actual_path);
             }
         } else {
             return token;
@@ -83,14 +129,14 @@ std::optional<OAuthToken> TokenManager::ensure_authenticated(
 
     // Interactive login required via console terminal
     std::cout << "\n[AUTH] No active valid session found. Launching Charles Schwab authentication...\n";
-    std::string login_cmd = "python " + python_auth_script + " --login";
+    std::string login_cmd = "python \"" + actual_script + "\" --login";
     int exit_code = std::system(login_cmd.c_str());
     if (exit_code != 0) {
         std::cerr << "[ERROR] Charles Schwab authentication was cancelled or failed.\n";
         return std::nullopt;
     }
 
-    return load_from_file(path);
+    return load_from_file(actual_path);
 }
 
 } // namespace schwab

@@ -134,32 +134,64 @@ Test your strategy with dry-run telemetry:
 
 To maintain strict separation between the open-source Schwab execution engine and proprietary quantitative strategies, models, and asset formulas:
 
-1. Add `schwab-executor` as a Git submodule or CMake dependency in your private repository:
-   ```powershell
-   git submodule add https://github.com/your-org/schwab-executor.git external/schwab-executor
+### Step 1: Add as Submodule or Subdirectory
+Add `schwab-executor` as a Git submodule or CMake dependency in your private repository:
+```bash
+git submodule add https://github.com/your-org/schwab-executor.git external/schwab-executor
+```
+
+### Step 2: Configure `CMakeLists.txt`
+Link the `schwab_core` library target in your private `CMakeLists.txt`. Using `EXCLUDE_FROM_ALL` ensures that only the core engine library is compiled into your application (omitting executor root binaries and test suites):
+```cmake
+add_subdirectory(
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/schwab-executor
+    ${CMAKE_BINARY_DIR}/schwab-executor
+    EXCLUDE_FROM_ALL
+)
+
+target_link_libraries(my_proprietary_trading_app PRIVATE
+    schwab_core
+)
+```
+
+### Step 3: Configure Environment & One-Time Authentication
+1. Create a `.env` file in your application root directory with your Schwab Developer Portal credentials:
+   ```ini
+   SCHWAB_APP_KEY=your_app_key_here
+   SCHWAB_APP_SECRET=your_app_secret_here
+   SCHWAB_ACCOUNT_HASH=your_account_hash_here
    ```
 
-2. Link `schwab_core` in your private `CMakeLists.txt`:
-   ```cmake
-   add_subdirectory(external/schwab-executor)
-   target_link_libraries(my_proprietary_trading_app PRIVATE schwab_core)
+2. Establish your initial OAuth session using the bundled Python authentication utility:
+   ```bash
+   python external/schwab-executor/python/auth_cli.py
    ```
+   Follow the interactive prompt to log in and authorize the app. This creates `.schwab_token.json` in your project root. Ensure you add `.*token*.json` to your `.gitignore`.
 
-3. Instantiate `ExecutionRunner` in your private entry point:
-   ```cpp
-   #include "schwab/execution_runner.hpp"
-   #include "my_proprietary_alpha_strategy.hpp"
+> [!NOTE]
+> **Automatic Token Lifecycle Management:**
+> At runtime, `TokenManager` automatically:
+> - Discovers `.schwab_token.json` from your project root, parent directory, or submodule path.
+> - Automatically detects expired access tokens and silently invokes `auth_cli.py --refresh` in the background with zero user intervention.
 
-   int main() {
-       schwab::ExecutionConfig config;
-       config.session_name = "LIVE_PRODUCTION";
+### Step 4: Instantiate `ExecutionRunner`
+```cpp
+#include "schwab/execution_runner.hpp"
+#include "my_proprietary_alpha_strategy.hpp"
 
-       auto strategy = std::make_shared<MyProprietaryAlphaStrategy>();
-       schwab::ExecutionRunner runner(config, strategy);
+int main() {
+    schwab::ExecutionConfig config;
+    config.session_name = "LIVE_PRODUCTION";
 
-       return runner.execute();
-   }
-   ```
+    auto strategy = std::make_shared<MyProprietaryAlphaStrategy>();
+    schwab::ExecutionRunner runner(config, strategy);
+
+    // Optional: Pre-warm TLS connection to eliminate cold-start execution jitter
+    runner.http_client().prewarm();
+
+    return runner.execute();
+}
+```
 
 This architecture ensures proprietary intellectual property remains 100% confidential in your private codebase while leveraging the shared, tested execution engine.
 
