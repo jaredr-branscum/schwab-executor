@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "schwab/token.hpp"
+#include "schwab/security.hpp"
 
 TEST_CASE("OAuthToken default state is expired", "[token]") {
     schwab::OAuthToken token;
@@ -68,4 +69,18 @@ TEST_CASE("OAuthToken precomputes authorization header for zero-allocation hot p
     token.access_token.clear();
     token.precompute_auth_header();
     CHECK(token.auth_header().empty());
+}
+
+TEST_CASE("secure_clear wipes memory before emptying string", "[security]") {
+    std::string secret = "SUPER_SENSITIVE_ACCOUNT_HASH_SECRET";
+    const char* raw_ptr = secret.data();
+    size_t len = secret.size();
+
+    schwab::secure_clear(secret);
+
+    CHECK(secret.empty());
+    // Verify buffer was zeroed in memory
+    for (size_t i = 0; i < len; ++i) {
+        CHECK(raw_ptr[i] == '\0');
+    }
 }
