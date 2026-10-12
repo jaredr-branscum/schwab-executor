@@ -802,4 +802,228 @@ TEST_CASE("ExecutionRunner multi-account batch execution (SCHWAB_ACCOUNTS=all)",
     }
 }
 
+TEST_CASE("ExecutionRunner concurrent multi-account dispatch architecture", "[execution_runner][concurrency]") {
+    std::vector<StrategyTargetWeight> targets = {
+        {Symbol("SPY"), 0.50}
+    };
+    auto strat = std::make_shared<SampleRebalanceStrategy>(targets);
+
+    AccountPortfolio acc1;
+    acc1.account_number = "11112222";
+    acc1.account_hash = "MOCK_HASH_ACC_1";
+    acc1.account_type = "INDIVIDUAL";
+    acc1.cash_balance = 0.0;
+    acc1.available_funds = 0.0;
+    acc1.liquidation_value = 50000.0;
+    acc1.positions.push_back(Position{
+        .quantity = 100.0,
+        .average_price = 450.0,
+        .current_price = 500.0,
+        .symbol = Symbol("SPY")
+    });
+
+    AccountPortfolio acc2;
+    acc2.account_number = "33334444";
+    acc2.account_hash = "MOCK_HASH_ACC_2";
+    acc2.account_type = "ROTH_IRA";
+    acc2.cash_balance = 0.0;
+    acc2.available_funds = 0.0;
+    acc2.liquidation_value = 50000.0;
+    acc2.positions.push_back(Position{
+        .quantity = 100.0,
+        .average_price = 450.0,
+        .current_price = 500.0,
+        .symbol = Symbol("SPY")
+    });
+
+    AccountPortfolio acc3;
+    acc3.account_number = "55556666";
+    acc3.account_hash = "MOCK_HASH_ACC_3";
+    acc3.account_type = "TRADITIONAL_IRA";
+    acc3.cash_balance = 0.0;
+    acc3.available_funds = 0.0;
+    acc3.liquidation_value = 50000.0;
+    acc3.positions.push_back(Position{
+        .quantity = 100.0,
+        .average_price = 450.0,
+        .current_price = 500.0,
+        .symbol = Symbol("SPY")
+    });
+
+    std::vector<AccountPortfolio> accounts = {acc1, acc2, acc3};
+
+    SECTION("Concurrent dispatch executes all accounts simultaneously in dry run") {
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.accounts_filter = "all";
+        cfg.enable_concurrent_dispatch = true;
+        cfg.max_concurrent_workers = 4;
+
+        ExecutionRunner runner(cfg, strat);
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        REQUIRE(exit_code == 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->total_accounts == 3);
+        CHECK(summary->succeeded_accounts == 3);
+        CHECK(summary->failed_accounts == 0);
+        CHECK(summary->total_orders_submitted == 3);
+        CHECK(summary->total_orders_succeeded == 3);
+
+        REQUIRE(summary->account_results.size() == 3);
+        CHECK(summary->account_results[0].account_number == "11112222");
+        CHECK(summary->account_results[0].success);
+        CHECK(summary->account_results[1].account_number == "33334444");
+        CHECK(summary->account_results[1].success);
+        CHECK(summary->account_results[2].account_number == "55556666");
+        CHECK(summary->account_results[2].success);
+
+        // Verify history contains all reports in order
+        REQUIRE(runner.execution_history().size() == 3);
+    }
+
+    SECTION("Disabling concurrent dispatch falls back to sequential execution with identical summary") {
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.accounts_filter = "all";
+        cfg.enable_concurrent_dispatch = false;
+
+        ExecutionRunner runner(cfg, strat);
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        REQUIRE(exit_code == 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->total_accounts == 3);
+        CHECK(summary->succeeded_accounts == 3);
+        CHECK(summary->failed_accounts == 0);
+        CHECK(summary->total_orders_submitted == 3);
+        CHECK(summary->total_orders_succeeded == 3);
+    }
+
+    SECTION("Max concurrent workers bounds thread pool when accounts exceed limit") {
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.accounts_filter = "all";
+        cfg.enable_concurrent_dispatch = true;
+        cfg.max_concurrent_workers = 1; // 1 worker thread executes all accounts
+
+        ExecutionRunner runner(cfg, strat);
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        REQUIRE(exit_code == 0);
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->total_accounts == 3);
+        CHECK(summary->succeeded_accounts == 3);
+    }
+
+    SECTION("Concurrent live dispatch via TransportFactory injects dedicated transports per worker") {
+        class MockConcurrentTransport : public ITransport {
+        public:
+            std::atomic<int>* prewarm_count{nullptr};
+            std::atomic<int>* send_count{nullptr};
+            bool connected{false};
+
+            bool prewarm() override {
+                connected = true;
+                if (prewarm_count) prewarm_count->fetch_add(1);
+                return true;
+            }
+            [[nodiscard]] bool is_connected() const noexcept override { return connected; }
+            [[nodiscard]] bool is_idle_expired() const noexcept override { return false; }
+            void disconnect() noexcept override { connected = false; }
+
+            [[nodiscard]] HttpResponse send(const HttpRequest& req) override {
+                if (send_count) send_count->fetch_add(1);
+                HttpResponse resp;
+                resp.status_code = 201;
+                resp.headers.push_back({"Location", std::string(req.path) + "/ORDER_CONCURRENT_123"});
+                resp.latency = std::chrono::microseconds{100};
+                return resp;
+            }
+        };
+
+        std::atomic<int> global_prewarms{0};
+        std::atomic<int> global_sends{0};
+
+        auto temp_env = std::filesystem::temp_directory_path() / "test_concurrent_live.env";
+        {
+            std::ofstream ef(temp_env);
+            ef << "SCHWAB_DRY_RUN=false\n";
+        }
+
+        auto temp_token = std::filesystem::temp_directory_path() / "test_concurrent_live_token.json";
+        {
+            auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::ofstream tf(temp_token);
+            tf << "{\n"
+               << "  \"access_token\": \"VALID_CONCURRENT_TEST_TOKEN\",\n"
+               << "  \"refresh_token\": \"VALID_REFRESH\",\n"
+               << "  \"token_type\": \"Bearer\",\n"
+               << "  \"expires_at\": " << (now_epoch + 3600) << ",\n"
+               << "  \"refresh_token_expires_at\": " << (now_epoch + 86400 * 7) << "\n"
+               << "}\n";
+        }
+
+        ExecutionConfig cfg;
+        cfg.dry_run = false;
+        cfg.config_path = temp_env;
+        cfg.token_path = temp_token;
+        cfg.accounts_filter = "all";
+        cfg.enable_concurrent_dispatch = true;
+        cfg.max_concurrent_workers = 4;
+
+        ExecutionRunner runner(cfg, strat);
+        runner.set_transport_factory([&]() {
+            auto t = std::make_unique<MockConcurrentTransport>();
+            t->prewarm_count = &global_prewarms;
+            t->send_count = &global_sends;
+            return t;
+        });
+
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        REQUIRE(exit_code == 0);
+        CHECK(global_sends.load() == 3); // 1 order per account across 3 accounts
+        CHECK(global_prewarms.load() >= 1); // prewarm was invoked
+
+        const auto& summary = runner.last_batch_summary();
+        REQUIRE(summary.has_value());
+        CHECK(summary->total_accounts == 3);
+        CHECK(summary->succeeded_accounts == 3);
+        CHECK(summary->failed_accounts == 0);
+
+        std::error_code ec;
+        std::filesystem::remove(temp_env, ec);
+        std::filesystem::remove(temp_token, ec);
+    }
+
+    SECTION("Environment variables parse SCHWAB_CONCURRENT_DISPATCH and SCHWAB_MAX_CONCURRENT_WORKERS") {
+        auto temp_env = std::filesystem::temp_directory_path() / "test_concurrent.env";
+        {
+            std::ofstream ef(temp_env);
+            ef << "SCHWAB_CONCURRENT_DISPATCH=false\n";
+            ef << "SCHWAB_MAX_CONCURRENT_WORKERS=8\n";
+        }
+
+        ExecutionConfig cfg;
+        cfg.config_path = temp_env;
+        cfg.dry_run = true;
+
+        ExecutionRunner runner(cfg, strat);
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+
+        REQUIRE(exit_code == 0);
+        // Verify runner adopted settings from .env
+        CHECK_FALSE(runner.config().enable_concurrent_dispatch);
+        CHECK(runner.config().max_concurrent_workers == 8);
+
+        std::error_code ec;
+        std::filesystem::remove(temp_env, ec);
+    }
+}
+
 

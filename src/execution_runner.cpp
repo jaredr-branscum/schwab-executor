@@ -3,11 +3,17 @@
 #include "schwab/security.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <thread>
+
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace schwab {
 
@@ -178,6 +184,229 @@ namespace {
     msg.append(": unquoted symbol with zero portfolio valuation.");
     diagnostics.push_back(std::move(msg));
     return 0.0;
+}
+
+/// @brief Pre-trade order validation, sequence partitioning (sells first, then buys),
+/// and cash limit gating across account state.
+[[nodiscard]] inline std::vector<Order> stage_and_validate_orders(
+    const AccountPortfolio& acc,
+    std::span<const Order> raw_orders,
+    RiskGuard& risk_guard,
+    std::span<const Quote> quotes,
+    bool dry_run,
+    std::vector<std::string>& diagnostics
+) {
+    // Sequencing: Partition Sells first, Buys second
+    std::vector<Order> staged_sells;
+    std::vector<Order> staged_buys;
+    staged_sells.reserve(raw_orders.size());
+    staged_buys.reserve(raw_orders.size());
+
+    for (const auto& ord : raw_orders) {
+        if (ord.side == OrderSide::Sell) {
+            staged_sells.push_back(ord);
+        } else {
+            staged_buys.push_back(ord);
+        }
+    }
+
+    std::vector<Order> approved_orders;
+    approved_orders.reserve(raw_orders.size());
+    bool has_rejected_sells = false;
+
+    // PASS 1: Validate and Stage Sells
+    for (const auto& ord : staged_sells) {
+        const Position* pos = find_position(acc.positions, ord.symbol);
+        const double current_qty = pos ? pos->quantity : 0.0;
+        const Quote* quote = find_quote(quotes, ord.symbol);
+
+        RiskCheckResult check;
+        if (quote != nullptr) {
+            check = risk_guard.validate_order(ord, *quote, current_qty);
+        } else {
+            const double market_price = resolve_reference_price(
+                ord, quotes, pos, dry_run, diagnostics
+            );
+            if (market_price <= 0.0 && !dry_run) [[unlikely]] {
+                has_rejected_sells = true;
+                continue;
+            }
+            check = risk_guard.validate_order(ord, current_qty, market_price);
+        }
+
+        if (check.approved) {
+            approved_orders.push_back(ord);
+        } else {
+            has_rejected_sells = true;
+            std::string wmsg = "  * [RISK WARNING] Order rejected for ";
+            wmsg.append(ord.symbol.view());
+            wmsg.append(": ");
+            wmsg.append(check.message);
+            diagnostics.push_back(std::move(wmsg));
+        }
+    }
+
+    // PASS 2: Validate and Stage Buys (Enforcing Atomic Abort if preceding Sells were blocked)
+    for (const auto& ord : staged_buys) {
+        if (has_rejected_sells) [[unlikely]] {
+            std::string amsg = "  * [ATOMIC ABORT] Buy order aborted for ";
+            amsg.append(ord.symbol.view());
+            amsg.append(": preceding sell order was blocked by risk controls");
+            diagnostics.push_back(std::move(amsg));
+            continue;
+        }
+
+        const Position* pos = find_position(acc.positions, ord.symbol);
+        const double current_qty = pos ? pos->quantity : 0.0;
+        const Quote* quote = find_quote(quotes, ord.symbol);
+
+        RiskCheckResult check;
+        if (quote != nullptr) {
+            check = risk_guard.validate_order(ord, *quote, current_qty);
+        } else {
+            const double market_price = resolve_reference_price(
+                ord, quotes, pos, dry_run, diagnostics
+            );
+            if (market_price <= 0.0 && !dry_run) [[unlikely]] {
+                continue;
+            }
+            check = risk_guard.validate_order(ord, current_qty, market_price);
+        }
+
+        if (check.approved) {
+            approved_orders.push_back(ord);
+        } else {
+            std::string wmsg = "  * [RISK WARNING] Order rejected for ";
+            wmsg.append(ord.symbol.view());
+            wmsg.append(": ");
+            wmsg.append(check.message);
+            diagnostics.push_back(std::move(wmsg));
+        }
+    }
+
+    // PASS 3: Aggregate Cash & Buying Power Gate
+    if (risk_guard.limits().enforce_cash_limits && !risk_guard.limits().allow_margin_borrowing) {
+        double total_available_cash = (std::max)(0.0, acc.available_cash());
+        for (const auto& ord : approved_orders) {
+            if (ord.side == OrderSide::Sell) {
+                double p = 0.0;
+                if (ord.type == OrderType::Limit && ord.limit_price.has_value() && *ord.limit_price > 0.0) {
+                    p = *ord.limit_price;
+                } else {
+                    const Quote* q = find_quote(quotes, ord.symbol);
+                    if (q != nullptr && q->is_valid()) {
+                        p = (q->bid_price > 0.0) ? q->bid_price : q->reference_price();
+                    } else {
+                        const Position* pos = find_position(acc.positions, ord.symbol);
+                        p = (pos != nullptr && pos->current_price > 0.0) ? pos->current_price : 0.0;
+                    }
+                }
+                if (p > 0.0) {
+                    total_available_cash += ord.quantity * p;
+                }
+            }
+        }
+
+        double total_buy_commitment = 0.0;
+        for (const auto& ord : approved_orders) {
+            if (ord.side == OrderSide::Buy) {
+                double p = 0.0;
+                if (ord.type == OrderType::Limit && ord.limit_price.has_value() && *ord.limit_price > 0.0) {
+                    p = *ord.limit_price;
+                } else {
+                    const Quote* q = find_quote(quotes, ord.symbol);
+                    if (q != nullptr && q->is_valid()) {
+                        p = (q->ask_price > 0.0) ? q->ask_price : q->reference_price();
+                    } else {
+                        const Position* pos = find_position(acc.positions, ord.symbol);
+                        p = (pos != nullptr && pos->current_price > 0.0) ? pos->current_price : 0.0;
+                    }
+                }
+                total_buy_commitment += ord.quantity * p;
+            }
+        }
+
+        auto cash_check = risk_guard.validate_cash_commitment(total_buy_commitment, total_available_cash);
+        if (!cash_check.approved) [[unlikely]] {
+            char diag_buf[256];
+            std::snprintf(diag_buf, sizeof(diag_buf),
+                "  * [ATOMIC ABORT] Entire rebalance batch aborted for account %.*s: Aggregate buy commitments ($%.2f) exceed available purchasing power ($%.2f) by $%.2f (unintended margin borrowing blocked)",
+                static_cast<int>(acc.masked_account_number().size()), acc.masked_account_number().data(),
+                total_buy_commitment, total_available_cash, total_buy_commitment - total_available_cash);
+            diagnostics.push_back(std::string(diag_buf));
+
+            approved_orders.clear();
+        }
+    }
+
+    return approved_orders;
+}
+
+/// @brief Generates simulated fill reconciliation for dry-run validation.
+[[nodiscard]] inline BatchReconciliationReport generate_simulated_reconciliation(
+    const ExecutionReport& report,
+    std::span<const Quote> quotes
+) {
+    BatchReconciliationReport sim_recon;
+    sim_recon.orders.reserve(report.results.size());
+    for (const auto& res : report.results) {
+        OrderReconciliationResult r;
+        r.symbol = res.order.symbol;
+        r.side = res.order.side;
+        r.ordered_quantity = res.order.quantity;
+        r.filled_quantity = res.order.quantity;
+        r.order_id = res.order_id.value_or("DRY_RUN_SIMULATED");
+        r.final_state = OrderExecutionState::Filled;
+        r.is_terminal = true;
+        r.is_filled = true;
+        const Quote* q = find_quote(quotes, r.symbol);
+        if (q != nullptr && q->is_valid()) {
+            double ref = (r.side == OrderSide::Buy) ? q->ask_price : q->bid_price;
+            if (ref <= 0.0) ref = q->reference_price();
+            r.average_fill_price = ref;
+            r.slippage = calculate_slippage(r.side, ref, ref);
+        } else {
+            r.average_fill_price = res.order.limit_price.value_or(100.0);
+        }
+        sim_recon.orders.push_back(std::move(r));
+    }
+    sim_recon.total_tracked = sim_recon.orders.size();
+    sim_recon.total_filled = sim_recon.orders.size();
+    sim_recon.all_terminal = true;
+    sim_recon.all_filled = true;
+    return sim_recon;
+}
+
+/// @brief Appends telemetry block to log file.
+inline void append_telemetry_file(
+    const std::filesystem::path& log_path,
+    std::string_view session_name,
+    std::string_view strategy_name,
+    std::string_view masked_account,
+    std::string_view table_str,
+    std::string_view recon_table_str
+) {
+    std::error_code ec;
+    if (log_path.has_parent_path()) {
+        std::filesystem::create_directories(log_path.parent_path(), ec);
+    }
+    std::ofstream log_file(log_path, std::ios::app);
+    if (log_file.is_open()) {
+        auto now_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm gm_tm;
+#if defined(_WIN32)
+        gmtime_s(&gm_tm, &now_t);
+#else
+        gmtime_r(&now_t, &gm_tm);
+#endif
+        log_file << "[" << std::put_time(&gm_tm, "%Y-%m-%d %H:%M:%S UTC") << "] "
+                 << "Mode: " << session_name << " | Strategy: " << strategy_name
+                 << " | Account: " << masked_account << "\n"
+                 << table_str << "\n";
+        if (!recon_table_str.empty()) {
+            log_file << recon_table_str << "\n";
+        }
+    }
 }
 
 } // namespace
@@ -381,6 +610,17 @@ int ExecutionRunner::execute(
         }
     }
 
+    // Populate concurrent dispatch settings from config if present
+    if (cfg.has_param("SCHWAB_CONCURRENT_DISPATCH")) {
+        config_.enable_concurrent_dispatch = cfg.get_bool("SCHWAB_CONCURRENT_DISPATCH", config_.enable_concurrent_dispatch);
+    }
+    if (cfg.has_param("SCHWAB_MAX_CONCURRENT_WORKERS")) {
+        int64_t max_w = cfg.get_int("SCHWAB_MAX_CONCURRENT_WORKERS", static_cast<int64_t>(config_.max_concurrent_workers));
+        if (max_w > 0) {
+            config_.max_concurrent_workers = static_cast<size_t>(max_w);
+        }
+    }
+
     last_market_quotes_.clear();
 
     // Ensure active OAuth session
@@ -560,7 +800,341 @@ int ExecutionRunner::execute(
         }
     }
 
-    // Iterate through resolved accounts
+    bool use_concurrent = (target_accounts.size() > 1) && config_.enable_concurrent_dispatch;
+
+    if (use_concurrent) {
+        std::cout << "  * Dispatch Engine    : [CONCURRENT WORKER POOL] Enabled (" 
+                  << target_accounts.size() << " accounts, max " 
+                  << config_.max_concurrent_workers << " workers)\n";
+
+        struct AccountWorkerContext {
+            size_t account_index{0};
+            AccountPortfolio account;
+            AccountSessionResult session_result;
+            RebalancePlan plan;
+            std::vector<std::string> diagnostics;
+            bool has_work{false};
+            bool pre_check_failed{false};
+            std::unique_ptr<HttpClient> dedicated_client{nullptr};
+            ExecutionReport report;
+            std::string formatted_table;
+            std::string formatted_recon_table;
+            std::chrono::steady_clock::time_point start_time;
+            std::chrono::steady_clock::time_point finish_time;
+        };
+
+        std::vector<AccountWorkerContext> contexts(target_accounts.size());
+        std::vector<std::vector<Order>> raw_orders_per_account(target_accounts.size());
+        std::vector<Symbol> additional_symbols_to_quote;
+
+        // Generate raw orders across all accounts and identify any missing quotes
+        for (size_t acc_idx = 0; acc_idx < target_accounts.size(); ++acc_idx) {
+            auto& ctx = contexts[acc_idx];
+            ctx.account_index = acc_idx;
+            ctx.account = target_accounts[acc_idx];
+
+            ctx.session_result.account_number = ctx.account.account_number;
+            ctx.session_result.masked_account_number = ctx.account.masked_account_number();
+            ctx.session_result.account_hash = ctx.account.account_hash;
+            ctx.session_result.account_type = ctx.account.account_type;
+            ctx.session_result.cash_balance = ctx.account.cash_balance;
+            ctx.session_result.liquidation_value = ctx.account.liquidation_value;
+            ctx.session_result.positions_count = ctx.account.positions.size();
+
+            // Validate account hash
+            if (ctx.account.account_hash.empty()) {
+                if (config_.dry_run && !config_.preview_only) {
+                    ctx.account.account_hash = "SIMULATED_ACCOUNT";
+                    ctx.session_result.account_hash = "SIMULATED_ACCOUNT";
+                } else {
+                    ctx.diagnostics.push_back("  * [ERROR] Account " + ctx.account.masked_account_number() + " missing encrypted hashValue. Skipping.");
+                    ctx.session_result.success = false;
+                    ctx.session_result.status_notes = "Missing hashValue";
+                    ctx.pre_check_failed = true;
+                    continue;
+                }
+            }
+
+            // Generate orders from strategy
+            raw_orders_per_account[acc_idx] = strategy_->generate_orders(
+                ctx.account.positions,
+                ctx.account.available_cash(),
+                last_market_quotes_
+            );
+
+            ctx.session_result.orders_generated = raw_orders_per_account[acc_idx].size();
+
+            if (raw_orders_per_account[acc_idx].empty()) {
+                ctx.session_result.success = true;
+                ctx.session_result.status_notes = "Zero orders needed";
+                ctx.has_work = false;
+                continue;
+            }
+
+            // Check for missing quotes
+            for (const auto& ord : raw_orders_per_account[acc_idx]) {
+                if (!ord.symbol.is_valid()) continue;
+                if (find_quote(last_market_quotes_, ord.symbol) == nullptr) {
+                    if (std::find(additional_symbols_to_quote.begin(), additional_symbols_to_quote.end(), ord.symbol) == additional_symbols_to_quote.end()) {
+                        additional_symbols_to_quote.push_back(ord.symbol);
+                    }
+                }
+            }
+        }
+
+        // Batch fetch any additional quotes needed across all accounts
+        if (!additional_symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
+            std::string quote_err;
+            auto new_quotes = MarketDataManager::fetch_quotes_batch(
+                http_client_,
+                additional_symbols_to_quote,
+                access_token,
+                &quote_err
+            );
+            if (!new_quotes.empty()) {
+                for (auto& q : new_quotes) {
+                    last_market_quotes_.push_back(std::move(q));
+                }
+            }
+        }
+
+        // Sequence and RiskGuard-validate each account
+        for (size_t acc_idx = 0; acc_idx < target_accounts.size(); ++acc_idx) {
+            auto& ctx = contexts[acc_idx];
+            if (ctx.pre_check_failed || ctx.session_result.orders_generated == 0) {
+                continue;
+            }
+
+            auto approved_orders = stage_and_validate_orders(
+                ctx.account,
+                raw_orders_per_account[acc_idx],
+                risk_guard,
+                last_market_quotes_,
+                config_.dry_run,
+                ctx.diagnostics
+            );
+
+            if (approved_orders.empty()) {
+                ctx.session_result.success = false;
+                ctx.session_result.status_notes = "Blocked by RiskGuard";
+                ctx.pre_check_failed = true;
+                ctx.has_work = false;
+                continue;
+            }
+
+            ctx.plan.orders = std::move(approved_orders);
+            ctx.has_work = true;
+        }
+
+        // Thread Worker Allocation & Dispatch
+        std::vector<size_t> active_indices;
+        for (size_t i = 0; i < contexts.size(); ++i) {
+            if (contexts[i].has_work) {
+                active_indices.push_back(i);
+            }
+        }
+
+        if (!active_indices.empty()) {
+            size_t max_workers = config_.max_concurrent_workers > 0 ? config_.max_concurrent_workers : 1;
+            size_t num_threads = (std::min)(active_indices.size(), max_workers);
+
+            // Instantiate dedicated transports
+            for (size_t idx : active_indices) {
+                if (transport_factory_) {
+                    contexts[idx].dedicated_client = std::make_unique<HttpClient>(transport_factory_());
+                } else {
+                    contexts[idx].dedicated_client = std::make_unique<HttpClient>();
+                }
+            }
+
+            std::atomic<bool> bell_triggered{false};
+            std::atomic<size_t> ready_count{0};
+            std::vector<std::thread> pool;
+            pool.reserve(num_threads);
+
+            for (size_t t_id = 0; t_id < num_threads; ++t_id) {
+                pool.emplace_back([&, t_id]() {
+                    // Pre-warm client for first account on this thread
+                    size_t first_idx = active_indices[t_id];
+                    if ((!config_.dry_run || config_.preview_only) && !contexts[first_idx].dedicated_client->is_connected()) {
+                        contexts[first_idx].dedicated_client->prewarm();
+                    }
+
+                    ready_count.fetch_add(1, std::memory_order_release);
+
+                    // Spin-wait barrier with CPU pause
+                    while (!bell_triggered.load(std::memory_order_acquire)) {
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
+                        _mm_pause();
+#else
+                        std::this_thread::yield();
+#endif
+                    }
+
+                    // Hot path dispatch
+                    for (size_t work_i = t_id; work_i < active_indices.size(); work_i += num_threads) {
+                        size_t idx = active_indices[work_i];
+                        auto& c = contexts[idx];
+
+                        // If not first account on this thread, ensure connection is hot
+                        if (work_i != t_id && (!config_.dry_run || config_.preview_only) && !c.dedicated_client->is_connected()) {
+                            c.dedicated_client->prewarm();
+                        }
+
+                        c.start_time = std::chrono::steady_clock::now();
+                        ExecutionDriverConfig driver_cfg;
+                        driver_cfg.account_hash = c.account.account_hash;
+                        driver_cfg.dry_run = config_.dry_run && !config_.preview_only;
+                        driver_cfg.preview_only = config_.preview_only;
+                        driver_cfg.stop_on_auth_failure = true;
+                        driver_cfg.abort_buys_on_sell_failure = true;
+
+                        try {
+                            ExecutionDriver driver(*c.dedicated_client, driver_cfg);
+                            c.report = driver.execute_plan(c.plan, access_token);
+                        } catch (const std::exception& ex) {
+                            c.report.all_succeeded = false;
+                            c.report.total_failed = c.plan.orders.size();
+                            c.diagnostics.push_back(std::string("  * [CRITICAL EXCEPTION] Worker failure: ") + ex.what());
+                        } catch (...) {
+                            c.report.all_succeeded = false;
+                            c.report.total_failed = c.plan.orders.size();
+                            c.diagnostics.push_back("  * [CRITICAL EXCEPTION] Unknown worker exception");
+                        }
+                        c.finish_time = std::chrono::steady_clock::now();
+                    }
+                });
+            }
+
+            // Main thread waits until all worker threads are spinning on barrier
+            while (ready_count.load(std::memory_order_acquire) < num_threads) {
+                std::this_thread::yield();
+            }
+
+            // SIMULTANEOUS ATOMIC DISPATCH
+            bell_triggered.store(true, std::memory_order_release);
+
+            for (auto& t : pool) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+        }
+
+        // Post-Barrier Output & File Logging (Main Thread)
+        for (size_t acc_idx = 0; acc_idx < target_accounts.size(); ++acc_idx) {
+            auto& ctx = contexts[acc_idx];
+
+            std::cout << "\n--------------------------------------------------------------------------------\n"
+                      << "  [ACCOUNT " << (acc_idx + 1) << "/" << target_accounts.size() << "] "
+                      << ctx.account.masked_account_number() << " (" << ctx.account.account_type << ")\n"
+                      << "--------------------------------------------------------------------------------\n"
+                      << "  * Available Cash     : $" << std::fixed << std::setprecision(2) << ctx.account.available_cash() << "\n"
+                      << "  * Liquidation Value  : $" << std::fixed << std::setprecision(2) << ctx.account.liquidation_value << "\n"
+                      << "  * Existing Positions : " << ctx.account.positions.size() << "\n"
+                      << "  * Strategy Output    : " << ctx.session_result.orders_generated << " orders emitted by strategy\n";
+
+            for (const auto& diag : ctx.diagnostics) {
+                std::cout << diag << "\n";
+            }
+
+            if (ctx.pre_check_failed) {
+                std::cerr << "  * Error: " << ctx.session_result.status_notes << "\n\n";
+                ctx.session_result.execution_time = std::chrono::microseconds{0};
+                batch_summary.failed_accounts++;
+                batch_summary.account_results.push_back(ctx.session_result);
+                continue;
+            }
+
+            if (!ctx.has_work) {
+                std::cout << "  * Status: [COMPLETED] Zero orders generated by strategy. Zero execution needed.\n";
+                ctx.session_result.execution_time = std::chrono::microseconds{0};
+                batch_summary.succeeded_accounts++;
+                batch_summary.account_results.push_back(ctx.session_result);
+                continue;
+            }
+
+            // Has executed orders
+            ctx.formatted_table = format_telemetry_table(ctx.report, config_.dry_run, config_.preview_only);
+            std::cout << ctx.formatted_table;
+
+            execution_history_.push_back(ctx.report);
+
+            if (telemetry_callback_) {
+                telemetry_callback_(ctx.report);
+            }
+
+            // Fill tracking
+            if (config_.track_fills && ctx.report.total_succeeded > 0 && !config_.preview_only) {
+                if (!config_.dry_run) {
+                    std::cout << "  * Order Tracking     : Reconciling post-dispatch fills with Charles Schwab...\n";
+                    OrderTrackerConfig tracker_cfg;
+                    tracker_cfg.account_hash = ctx.account.account_hash;
+                    tracker_cfg.polling_interval_ms = config_.fill_poll_interval_ms;
+                    tracker_cfg.timeout_ms = config_.fill_poll_timeout_ms;
+
+                    OrderTracker tracker(*ctx.dedicated_client, tracker_cfg);
+                    BatchReconciliationReport recon = tracker.reconcile_report(ctx.report, access_token, last_market_quotes_);
+
+                    ctx.formatted_recon_table = format_reconciliation_table(recon, last_market_quotes_);
+                    std::cout << ctx.formatted_recon_table;
+                    last_reconciliation_report_ = recon;
+                } else {
+                    BatchReconciliationReport sim_recon = generate_simulated_reconciliation(ctx.report, last_market_quotes_);
+                    ctx.formatted_recon_table = format_reconciliation_table(sim_recon, last_market_quotes_);
+                    std::cout << ctx.formatted_recon_table;
+                    last_reconciliation_report_ = sim_recon;
+                }
+            }
+
+            // Atomic file logging
+            if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
+                append_telemetry_file(
+                    *config_.telemetry_log_path,
+                    config_.session_name,
+                    strategy_->name(),
+                    ctx.account.masked_account_number(),
+                    ctx.formatted_table,
+                    ctx.formatted_recon_table
+                );
+            }
+
+            ctx.session_result.orders_succeeded = ctx.report.total_succeeded;
+            ctx.session_result.orders_failed = ctx.report.total_failed;
+            ctx.session_result.success = ctx.report.all_succeeded;
+            ctx.session_result.status_notes = ctx.report.all_succeeded ? "All orders completed" : "Dispatch failures";
+            ctx.session_result.execution_time = std::chrono::duration_cast<std::chrono::microseconds>(ctx.finish_time - ctx.start_time);
+
+            if (ctx.report.all_succeeded) {
+                batch_summary.succeeded_accounts++;
+            } else {
+                batch_summary.failed_accounts++;
+            }
+            batch_summary.total_orders_submitted += ctx.report.total_submitted;
+            batch_summary.total_orders_succeeded += ctx.report.total_succeeded;
+            batch_summary.total_orders_failed += ctx.report.total_failed;
+            batch_summary.account_results.push_back(ctx.session_result);
+        }
+
+        batch_summary.total_session_time = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - session_start
+        );
+        last_batch_summary_ = batch_summary;
+
+        std::string summary_table = format_batch_summary_table(batch_summary);
+        std::cout << summary_table;
+
+        if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
+            std::ofstream log_file(*config_.telemetry_log_path, std::ios::app);
+            if (log_file.is_open()) {
+                log_file << summary_table << "\n";
+            }
+        }
+
+        return (batch_summary.failed_accounts == 0) ? 0 : 1;
+    }
+
+    // Single-account / Sequential Execution Path
     for (size_t acc_idx = 0; acc_idx < target_accounts.size(); ++acc_idx) {
         auto& acc = target_accounts[acc_idx];
         auto acc_start = std::chrono::steady_clock::now();
@@ -667,150 +1241,14 @@ int ExecutionRunner::execute(
             }
         }
 
-        // Sequencing: Partition Sells first, Buys second
-        std::vector<Order> staged_sells;
-        std::vector<Order> staged_buys;
-        staged_sells.reserve(raw_orders.size());
-        staged_buys.reserve(raw_orders.size());
-
-        for (const auto& ord : raw_orders) {
-            if (ord.side == OrderSide::Sell) {
-                staged_sells.push_back(ord);
-            } else {
-                staged_buys.push_back(ord);
-            }
-        }
-
-        std::vector<Order> approved_orders;
-        approved_orders.reserve(raw_orders.size());
-        bool has_rejected_sells = false;
-
-        // PASS 1: Validate and Stage Sells
-        for (const auto& ord : staged_sells) {
-            const Position* pos = find_position(acc.positions, ord.symbol);
-            const double current_qty = pos ? pos->quantity : 0.0;
-            const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
-
-            RiskCheckResult check;
-            if (quote != nullptr) {
-                check = risk_guard.validate_order(ord, *quote, current_qty);
-            } else {
-                const double market_price = resolve_reference_price(
-                    ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
-                );
-                if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
-                    has_rejected_sells = true;
-                    continue;
-                }
-                check = risk_guard.validate_order(ord, current_qty, market_price);
-            }
-
-            if (check.approved) {
-                approved_orders.push_back(ord);
-            } else {
-                has_rejected_sells = true;
-                std::string msg = "  * [RISK WARNING] Order rejected for ";
-                msg.append(ord.symbol.view());
-                msg.append(": ");
-                msg.append(check.message);
-                deferred_diagnostics.push_back(std::move(msg));
-            }
-        }
-
-        // PASS 2: Validate and Stage Buys (Enforcing Atomic Abort if preceding Sells were blocked)
-        for (const auto& ord : staged_buys) {
-            if (has_rejected_sells) [[unlikely]] {
-                std::string msg = "  * [ATOMIC ABORT] Buy order aborted for ";
-                msg.append(ord.symbol.view());
-                msg.append(": preceding sell order was blocked by risk controls");
-                deferred_diagnostics.push_back(std::move(msg));
-                continue;
-            }
-
-            const Position* pos = find_position(acc.positions, ord.symbol);
-            const double current_qty = pos ? pos->quantity : 0.0;
-            const Quote* quote = find_quote(last_market_quotes_, ord.symbol);
-
-            RiskCheckResult check;
-            if (quote != nullptr) {
-                check = risk_guard.validate_order(ord, *quote, current_qty);
-            } else {
-                const double market_price = resolve_reference_price(
-                    ord, last_market_quotes_, pos, config_.dry_run, deferred_diagnostics
-                );
-                if (market_price <= 0.0 && !config_.dry_run) [[unlikely]] {
-                    continue;
-                }
-                check = risk_guard.validate_order(ord, current_qty, market_price);
-            }
-
-            if (check.approved) {
-                approved_orders.push_back(ord);
-            } else {
-                std::string msg = "  * [RISK WARNING] Order rejected for ";
-                msg.append(ord.symbol.view());
-                msg.append(": ");
-                msg.append(check.message);
-                deferred_diagnostics.push_back(std::move(msg));
-            }
-        }
-
-        // PASS 3: Aggregate Cash & Buying Power Gate (Defense-in-Depth)
-        // Ensures total buy commitments at limit/reference prices strictly never exceed available cash + approved sell proceeds.
-        if (risk_guard.limits().enforce_cash_limits && !risk_guard.limits().allow_margin_borrowing) {
-            double total_available_cash = (std::max)(0.0, acc.available_cash());
-            for (const auto& ord : approved_orders) {
-                if (ord.side == OrderSide::Sell) {
-                    double p = 0.0;
-                    if (ord.type == OrderType::Limit && ord.limit_price.has_value() && *ord.limit_price > 0.0) {
-                        p = *ord.limit_price;
-                    } else {
-                        const Quote* q = find_quote(last_market_quotes_, ord.symbol);
-                        if (q != nullptr && q->is_valid()) {
-                            p = (q->bid_price > 0.0) ? q->bid_price : q->reference_price();
-                        } else {
-                            const Position* pos = find_position(acc.positions, ord.symbol);
-                            p = (pos != nullptr && pos->current_price > 0.0) ? pos->current_price : 0.0;
-                        }
-                    }
-                    if (p > 0.0) {
-                        total_available_cash += ord.quantity * p;
-                    }
-                }
-            }
-
-            double total_buy_commitment = 0.0;
-            for (const auto& ord : approved_orders) {
-                if (ord.side == OrderSide::Buy) {
-                    double p = 0.0;
-                    if (ord.type == OrderType::Limit && ord.limit_price.has_value() && *ord.limit_price > 0.0) {
-                        p = *ord.limit_price;
-                    } else {
-                        const Quote* q = find_quote(last_market_quotes_, ord.symbol);
-                        if (q != nullptr && q->is_valid()) {
-                            p = (q->ask_price > 0.0) ? q->ask_price : q->reference_price();
-                        } else {
-                            const Position* pos = find_position(acc.positions, ord.symbol);
-                            p = (pos != nullptr && pos->current_price > 0.0) ? pos->current_price : 0.0;
-                        }
-                    }
-                    total_buy_commitment += ord.quantity * p;
-                }
-            }
-
-            auto cash_check = risk_guard.validate_cash_commitment(total_buy_commitment, total_available_cash);
-            if (!cash_check.approved) [[unlikely]] {
-                char diag_buf[256];
-                std::snprintf(diag_buf, sizeof(diag_buf),
-                    "  * [ATOMIC ABORT] Entire rebalance batch aborted for account %.*s: Aggregate buy commitments ($%.2f) exceed available purchasing power ($%.2f) by $%.2f (unintended margin borrowing blocked)",
-                    static_cast<int>(acc.masked_account_number().size()), acc.masked_account_number().data(),
-                    total_buy_commitment, total_available_cash, total_buy_commitment - total_available_cash);
-                deferred_diagnostics.push_back(std::string(diag_buf));
-
-                // Atomic Batch Abort: drop all orders (sells and buys) to preserve portfolio state integrity
-                approved_orders.clear();
-            }
-        }
+        auto approved_orders = stage_and_validate_orders(
+            acc,
+            raw_orders,
+            risk_guard,
+            last_market_quotes_,
+            config_.dry_run,
+            deferred_diagnostics
+        );
 
         if (approved_orders.empty()) {
             for (const auto& diag : deferred_diagnostics) {
@@ -873,33 +1311,7 @@ int ExecutionRunner::execute(
                 std::cout << recon_table_str;
                 last_reconciliation_report_ = recon;
             } else {
-                BatchReconciliationReport sim_recon;
-                sim_recon.orders.reserve(report.results.size());
-                for (const auto& res : report.results) {
-                    OrderReconciliationResult r;
-                    r.symbol = res.order.symbol;
-                    r.side = res.order.side;
-                    r.ordered_quantity = res.order.quantity;
-                    r.filled_quantity = res.order.quantity;
-                    r.order_id = res.order_id.value_or("DRY_RUN_SIMULATED");
-                    r.final_state = OrderExecutionState::Filled;
-                    r.is_terminal = true;
-                    r.is_filled = true;
-                    const Quote* q = find_quote(last_market_quotes_, r.symbol);
-                    if (q != nullptr && q->is_valid()) {
-                        double ref = (r.side == OrderSide::Buy) ? q->ask_price : q->bid_price;
-                        if (ref <= 0.0) ref = q->reference_price();
-                        r.average_fill_price = ref;
-                        r.slippage = calculate_slippage(r.side, ref, ref);
-                    } else {
-                        r.average_fill_price = res.order.limit_price.value_or(100.0);
-                    }
-                    sim_recon.orders.push_back(std::move(r));
-                }
-                sim_recon.total_tracked = sim_recon.orders.size();
-                sim_recon.total_filled = sim_recon.orders.size();
-                sim_recon.all_terminal = true;
-                sim_recon.all_filled = true;
+                BatchReconciliationReport sim_recon = generate_simulated_reconciliation(report, last_market_quotes_);
                 recon_table_str = format_reconciliation_table(sim_recon, last_market_quotes_);
                 std::cout << recon_table_str;
                 last_reconciliation_report_ = sim_recon;
@@ -907,27 +1319,14 @@ int ExecutionRunner::execute(
         }
 
         if (!config_.dry_run && config_.telemetry_log_path.has_value()) {
-            std::error_code ec;
-            if (config_.telemetry_log_path->has_parent_path()) {
-                std::filesystem::create_directories(config_.telemetry_log_path->parent_path(), ec);
-            }
-            std::ofstream log_file(*config_.telemetry_log_path, std::ios::app);
-            if (log_file.is_open()) {
-                auto now_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                std::tm gm_tm;
-#if defined(_WIN32)
-                gmtime_s(&gm_tm, &now_t);
-#else
-                gmtime_r(&now_t, &gm_tm);
-#endif
-                log_file << "[" << std::put_time(&gm_tm, "%Y-%m-%d %H:%M:%S UTC") << "] "
-                         << "Mode: " << config_.session_name << " | Strategy: " << strategy_->name()
-                         << " | Account: " << acc.masked_account_number() << "\n"
-                         << table_str << "\n";
-                if (!recon_table_str.empty()) {
-                    log_file << recon_table_str << "\n";
-                }
-            }
+            append_telemetry_file(
+                *config_.telemetry_log_path,
+                config_.session_name,
+                strategy_->name(),
+                acc.masked_account_number(),
+                table_str,
+                recon_table_str
+            );
         }
 
         acc_res.orders_succeeded = report.total_succeeded;

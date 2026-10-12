@@ -41,6 +41,8 @@ struct ExecutionConfig {
     uint32_t fill_poll_timeout_ms{5000};            ///< Maximum timeout in ms for fill reconciliation
     bool enforce_cash_limits{true};                 ///< Enforce aggregate buy commitments <= available cash + sell proceeds
     bool allow_margin_borrowing{false};             ///< If false, blocks buy orders that exceed cash to prevent unintended margin debt
+    bool enable_concurrent_dispatch{true};          ///< Enable pre-warmed concurrent worker dispatch for multi-account portfolios
+    size_t max_concurrent_workers{16};              ///< Maximum concurrent worker threads (bounds simultaneous threads)
 };
 
 /**
@@ -133,9 +135,18 @@ public:
     }
 
     using TelemetryCallback = std::function<void(const ExecutionReport&)>;
+    using TransportFactory = std::function<std::unique_ptr<ITransport>()>;
 
     void set_telemetry_callback(TelemetryCallback cb) noexcept {
         telemetry_callback_ = std::move(cb);
+    }
+
+    void set_transport_factory(TransportFactory factory) noexcept {
+        transport_factory_ = std::move(factory);
+    }
+
+    [[nodiscard]] const TransportFactory& transport_factory() const noexcept {
+        return transport_factory_;
     }
 
     [[nodiscard]] std::span<const ExecutionReport> execution_history() const noexcept {
@@ -162,6 +173,7 @@ private:
     ExecutionConfig config_;
     std::shared_ptr<IStrategy> strategy_;
     HttpClient http_client_{};
+    TransportFactory transport_factory_{nullptr};
     TelemetryCallback telemetry_callback_{nullptr};
     std::vector<ExecutionReport> execution_history_{};
     std::vector<Quote> last_market_quotes_{};
