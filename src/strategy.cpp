@@ -159,13 +159,13 @@ std::vector<StrategyTargetWeight> SampleRebalanceStrategy::parse_targets(std::st
             continue;
         }
 
-        size_t colon_pos = token.find(':');
-        if (colon_pos == std::string_view::npos || colon_pos == 0 || colon_pos == token.size() - 1) {
+        size_t sep_pos = token.find_first_of(":=");
+        if (sep_pos == std::string_view::npos || sep_pos == 0 || sep_pos == token.size() - 1) {
             continue;
         }
 
-        std::string_view sym_sv = token.substr(0, colon_pos);
-        std::string_view weight_sv = token.substr(colon_pos + 1);
+        std::string_view sym_sv = token.substr(0, sep_pos);
+        std::string_view weight_sv = token.substr(sep_pos + 1);
 
         while (!sym_sv.empty() && std::isspace(static_cast<unsigned char>(sym_sv.front()))) {
             sym_sv.remove_prefix(1);

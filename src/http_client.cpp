@@ -6,6 +6,7 @@
 #endif
 
 #include "schwab/http_client.hpp"
+#include "schwab/security.hpp"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -111,6 +112,10 @@ public:
 
     ~WinHttpTransport() override {
         disconnect();
+        if (!headers_buf_.empty()) {
+            secure_zero_memory(headers_buf_.data(), headers_buf_.capacity() * sizeof(wchar_t));
+            headers_buf_.clear();
+        }
     }
 
     bool prewarm() override {
@@ -248,23 +253,42 @@ private:
             return RequestResult::PreSendFailure;
         }
 
-        // Build wide headers string in pre-reserved scratch buffer
-        headers_buf_.clear();
+        // Build wide headers string in pre-reserved scratch buffer; wipe any residual secrets
+        if (!headers_buf_.empty()) {
+            secure_zero_memory(headers_buf_.data(), headers_buf_.size() * sizeof(wchar_t));
+            headers_buf_.clear();
+        }
+
         if (!request.auth_header.empty()) {
             headers_buf_ += L"Authorization: ";
             to_wide_buffer(request.auth_header, headers_buf_);
             headers_buf_ += L"\r\n";
         }
-        if (!request.content_type.empty()) {
+
+        // RFC 7231 / Akamai WAF: Content-Type MUST only be sent if payload body is present,
+        // or method is POST / PUT / PATCH. Sending Content-Type on GET causes Schwab to return HTTP 400.
+        const bool has_body = !request.body.empty() ||
+                              request.method == HttpMethod::Post ||
+                              request.method == HttpMethod::Put ||
+                              request.method == HttpMethod::Patch;
+        if (has_body && !request.content_type.empty()) {
             headers_buf_ += L"Content-Type: ";
             to_wide_buffer(request.content_type, headers_buf_);
             headers_buf_ += L"\r\n";
         }
+
         if (!request.accept.empty()) {
             headers_buf_ += L"Accept: ";
             to_wide_buffer(request.accept, headers_buf_);
             headers_buf_ += L"\r\n";
         }
+
+        if (!config_.user_agent.empty()) {
+            headers_buf_ += L"User-Agent: ";
+            to_wide_buffer(config_.user_agent, headers_buf_);
+            headers_buf_ += L"\r\n";
+        }
+
         for (const auto& h : request.extra_headers) {
             if (!h.name.empty()) {
                 to_wide_buffer(h.name, headers_buf_);
@@ -513,6 +537,7 @@ HttpResponse HttpClient::get(std::string_view path, std::string_view auth_header
     req.method = HttpMethod::Get;
     req.path = path;
     req.auth_header = auth_header;
+    req.content_type = {};
     return send(req);
 }
 
@@ -539,6 +564,7 @@ HttpResponse HttpClient::del(std::string_view path, std::string_view auth_header
     req.method = HttpMethod::Delete;
     req.path = path;
     req.auth_header = auth_header;
+    req.content_type = {};
     return send(req);
 }
 

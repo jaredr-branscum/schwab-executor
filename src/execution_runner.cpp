@@ -1,5 +1,6 @@
 #include "schwab/execution_runner.hpp"
 #include "schwab/order_serializer.hpp"
+#include "schwab/security.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -329,6 +330,11 @@ int ExecutionRunner::execute(
         std::cout << "  * OAuth Status       : [AUTHENTICATED] Access Token Valid\n";
     }
 
+    struct TokenScrubber {
+        std::string& tok;
+        ~TokenScrubber() { secure_clear(tok); }
+    } scrubber{access_token};
+
     // Resolve Current Portfolio Context (Positions & Liquid Cash)
     std::vector<Position> positions;
     double available_cash = 0.0;
@@ -339,7 +345,7 @@ int ExecutionRunner::execute(
         available_cash = simulated_cash.value_or(100'000.0);
         std::cout << "  * Portfolio Context  : Simulated (" << positions.size() 
                   << " positions, Cash: $" << std::fixed << std::setprecision(2) << available_cash << ")\n";
-    } else if (config_.dry_run && access_token == "SIMULATED_ACCESS_TOKEN") {
+    } else if (config_.dry_run && (access_token == "SIMULATED_ACCESS_TOKEN" || account_hash == "SIMULATED_ACCOUNT")) {
         available_cash = 100'000.0;
         std::cout << "  * Portfolio Context  : Offline Simulation (0 positions, Cash: $" 
                   << std::fixed << std::setprecision(2) << available_cash << ")\n";
@@ -385,7 +391,7 @@ int ExecutionRunner::execute(
     limits.max_order_notional = cfg.execution.max_order_notional;
     limits.price_collar_percent = cfg.get_double("SCHWAB_PRICE_COLLAR_PERCENT", 0.05);
     limits.max_bid_ask_spread_bps = cfg.get_double("SCHWAB_MAX_SPREAD_BPS", 50.0);
-    limits.enforce_moc_cutoff = true;
+    limits.enforce_moc_cutoff = !config_.dry_run;
     limits.dry_run = false; // Allow plan generation; ExecutionDriver handles dry-run simulation
     limits.reject_crossed_book = true;
     RiskGuard risk_guard(limits);

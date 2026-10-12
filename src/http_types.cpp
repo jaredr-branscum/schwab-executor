@@ -127,13 +127,18 @@ size_t HttpRequest::estimated_wire_size(std::string_view host) const noexcept {
     if (!auth_header.empty()) {
         sz += 15 + auth_header.size() + 2;                      // "Authorization: ...\r\n"
     }
-    if (!content_type.empty()) {
+    const bool has_body = !body.empty() ||
+                          method == HttpMethod::Post ||
+                          method == HttpMethod::Put ||
+                          method == HttpMethod::Patch;
+
+    if (has_body && !content_type.empty()) {
         sz += 14 + content_type.size() + 2;                     // "Content-Type: ...\r\n"
     }
     if (!accept.empty()) {
         sz += 8 + accept.size() + 2;                            // "Accept: ...\r\n"
     }
-    if (!body.empty() || method == HttpMethod::Post || method == HttpMethod::Put) {
+    if (has_body) {
         sz += 16 + 10 + 2;                                      // "Content-Length: 1234567890\r\n"
     }
     for (const auto& h : extra_headers) {
@@ -172,7 +177,12 @@ void HttpRequest::format_wire(std::string_view host, std::string& out_buffer) co
         out_buffer.append("\r\n");
     }
 
-    if (!content_type.empty()) {
+    const bool has_body = !body.empty() ||
+                          method == HttpMethod::Post ||
+                          method == HttpMethod::Put ||
+                          method == HttpMethod::Patch;
+
+    if (has_body && !content_type.empty()) {
         out_buffer.append("Content-Type: ");
         out_buffer.append(content_type);
         out_buffer.append("\r\n");
