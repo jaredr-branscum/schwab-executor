@@ -208,11 +208,14 @@ int main(int argc, char* argv[]) {
     } else if (mode == "status") {
         return handle_status(token_path);
     } else if (mode == "execute") {
+        schwab::Config cfg = schwab::Config::load_from_file(config_path_str);
+
         schwab::ExecutionConfig exec_cfg;
         exec_cfg.session_name = "EXECUTE";
         exec_cfg.config_path = config_path_str;
         exec_cfg.token_path = token_path;
         exec_cfg.account_hash_override = std::string(account_hash_str);
+        exec_cfg.dry_run = cfg.execution.dry_run;
         if (!accounts_filter_str.empty()) {
             exec_cfg.accounts_filter = std::string(accounts_filter_str);
         }
@@ -230,7 +233,6 @@ int main(int argc, char* argv[]) {
             exec_cfg.track_fills = true;
         }
 
-        schwab::Config cfg = schwab::Config::load_from_file(config_path_str);
         auto strat = resolve_strategy(cfg);
 
         schwab::ExecutionRunner runner(std::move(exec_cfg), std::move(strat));
