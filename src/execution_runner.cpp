@@ -29,21 +29,22 @@ std::string ExecutionRunner::format_telemetry_table(
 ) {
     std::ostringstream ss;
 
-    ss << "\n================================================================================================================\n"
+    ss << "\n========================================================================================================================\n"
        << "  [SCHWAB-EXECUTOR] "
        << (is_preview ? "BROKER ORDER PREVIEW VALIDATION (/previewOrder)" : (is_dry_run ? "SIMULATION TELEMETRY (DRY RUN)" : "LIVE BROKER EXECUTION REPORT")) << "\n"
-       << "================================================================================================================\n"
+       << "========================================================================================================================\n"
        << "  " << std::left 
        << std::setw(6)  << "SIDE"
        << std::setw(10) << "SYMBOL"
        << std::setw(14) << "TAG"
        << std::setw(12) << "QUANTITY"
+       << std::setw(12) << "PRICE"
        << std::setw(16) << "TYPE"
        << std::setw(12) << "STATUS"
        << std::setw(22) << "ORDER ID"
        << std::setw(16) << "LATENCY (us)"
        << "NOTES\n"
-       << "  ----------------------------------------------------------------------------------------------------------------\n";
+       << "  ------------------------------------------------------------------------------------------------------------------------\n";
 
     for (const auto& res : report.results) {
         std::string side_str(to_string(res.order.side));
@@ -58,11 +59,28 @@ std::string ExecutionRunner::format_telemetry_table(
         std::ostringstream qty_stream;
         qty_stream << std::fixed << std::setprecision(2) << res.order.quantity;
 
+        std::string price_str = "-";
+        if (res.order.type == OrderType::Limit && res.order.limit_price.has_value() && *res.order.limit_price > 0.0) {
+            std::ostringstream ps;
+            const double p = *res.order.limit_price;
+            if (std::abs(p * 100.0 - std::round(p * 100.0)) > 1e-4) {
+                ps << "$" << std::fixed << std::setprecision(4) << p;
+            } else {
+                ps << "$" << std::fixed << std::setprecision(2) << p;
+            }
+            price_str = ps.str();
+        } else if (res.order.type == OrderType::Market) {
+            price_str = "MKT";
+        } else if (res.order.type == OrderType::MarketOnClose) {
+            price_str = "MOC";
+        }
+
         ss << "  " << std::left
            << std::setw(6)  << side_str
            << std::setw(10) << sym_str
            << std::setw(14) << tag_str
            << std::setw(12) << qty_stream.str()
+           << std::setw(12) << price_str
            << std::setw(16) << type_str
            << std::setw(12) << status_str
            << std::setw(22) << id_str
@@ -70,12 +88,12 @@ std::string ExecutionRunner::format_telemetry_table(
            << (res.success ? "" : res.error_message) << "\n";
     }
 
-    ss << "  ----------------------------------------------------------------------------------------------------------------\n"
+    ss << "  ------------------------------------------------------------------------------------------------------------------------\n"
        << "  Total Orders Submitted: " << report.total_submitted
        << " | Succeeded: " << report.total_succeeded
        << " | Failed: " << report.total_failed
        << " | Total Latency: " << (report.total_execution_time.count() / 1000.0) << " ms\n"
-       << "================================================================================================================\n\n";
+       << "========================================================================================================================\n\n";
 
     return ss.str();
 }

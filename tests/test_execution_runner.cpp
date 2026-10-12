@@ -78,6 +78,37 @@ TEST_CASE("ExecutionRunner Telemetry Table formatting", "[execution_runner]") {
 
         REQUIRE(table.find("LIVE BROKER EXECUTION REPORT") != std::string::npos);
         REQUIRE(table.find("FILLED/STAGED") != std::string::npos);
+        REQUIRE(table.find("PRICE") != std::string::npos);
+    }
+
+    SECTION("Preview order validation displays limit price alongside quantity") {
+        ExecutionReport preview_report;
+        preview_report.total_submitted = 1;
+        preview_report.total_succeeded = 1;
+        preview_report.total_failed = 0;
+        preview_report.total_execution_time = std::chrono::microseconds(750);
+        preview_report.all_succeeded = true;
+
+        OrderExecutionResult r_lim;
+        r_lim.order.side = OrderSide::Buy;
+        r_lim.order.symbol = Symbol("SPY");
+        r_lim.order.quantity = 142.60;
+        r_lim.order.type = OrderType::Limit;
+        r_lim.order.limit_price = 120.18;
+        r_lim.order.tag = StrategyTag("REBALANCE");
+        r_lim.success = true;
+        r_lim.order_id = "PREVIEW_VALIDATED";
+        r_lim.latency = std::chrono::microseconds(450);
+        preview_report.results.push_back(r_lim);
+
+        std::string preview_table = ExecutionRunner::format_telemetry_table(preview_report, false, true);
+
+        REQUIRE(preview_table.find("BROKER ORDER PREVIEW VALIDATION (/previewOrder)") != std::string::npos);
+        REQUIRE(preview_table.find("PRICE") != std::string::npos);
+        REQUIRE(preview_table.find("142.60") != std::string::npos);
+        REQUIRE(preview_table.find("$120.18") != std::string::npos);
+        REQUIRE(preview_table.find("LIMIT") != std::string::npos);
+        REQUIRE(preview_table.find("PREVIEW_OK") != std::string::npos);
     }
 }
 
