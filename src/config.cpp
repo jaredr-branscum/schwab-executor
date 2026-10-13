@@ -220,6 +220,12 @@ void Config::apply_environment_overrides() {
             execution.request_timeout_ms = to;
         }
     }
+    if (const char* v = check_env("SCHWAB_CONCURRENT_DISPATCH")) {
+        custom_params["SCHWAB_CONCURRENT_DISPATCH"] = std::string(v);
+    }
+    if (const char* v = check_env("SCHWAB_MAX_CONCURRENT_WORKERS")) {
+        custom_params["SCHWAB_MAX_CONCURRENT_WORKERS"] = std::string(v);
+    }
 }
 
 Config Config::load_from_file(const std::filesystem::path& env_path) {
