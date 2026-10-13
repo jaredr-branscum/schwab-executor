@@ -35,10 +35,10 @@ std::string ExecutionRunner::format_telemetry_table(
 ) {
     std::ostringstream ss;
 
-    ss << "\n========================================================================================================================\n"
+    ss << "\n================================================================================================================================\n"
        << "  [SCHWAB-EXECUTOR] "
        << (is_preview ? "BROKER ORDER PREVIEW VALIDATION (/previewOrder)" : (is_dry_run ? "SIMULATION TELEMETRY (DRY RUN)" : "LIVE BROKER EXECUTION REPORT")) << "\n"
-       << "========================================================================================================================\n"
+       << "================================================================================================================================\n"
        << "  " << std::left 
        << std::setw(6)  << "SIDE"
        << std::setw(10) << "SYMBOL"
@@ -48,9 +48,10 @@ std::string ExecutionRunner::format_telemetry_table(
        << std::setw(16) << "TYPE"
        << std::setw(12) << "STATUS"
        << std::setw(22) << "ORDER ID"
-       << std::setw(16) << "LATENCY (us)"
+       << std::setw(14) << "ENGINE (us)"
+       << std::setw(16) << "NETWORK RTT (ms)"
        << "NOTES\n"
-       << "  ------------------------------------------------------------------------------------------------------------------------\n";
+       << "  --------------------------------------------------------------------------------------------------------------------------------\n";
 
     for (const auto& res : report.results) {
         std::string side_str(to_string(res.order.side));
@@ -81,6 +82,13 @@ std::string ExecutionRunner::format_telemetry_table(
             price_str = "MOC";
         }
 
+        std::ostringstream wire_stream;
+        if (res.latency.count() > 0) {
+            wire_stream << std::fixed << std::setprecision(1) << (res.latency.count() / 1000.0) << " ms";
+        } else {
+            wire_stream << "0.0 ms";
+        }
+
         ss << "  " << std::left
            << std::setw(6)  << side_str
            << std::setw(10) << sym_str
@@ -90,16 +98,27 @@ std::string ExecutionRunner::format_telemetry_table(
            << std::setw(16) << type_str
            << std::setw(12) << status_str
            << std::setw(22) << id_str
-           << std::setw(16) << res.latency.count()
+           << std::setw(14) << res.engine_latency.count()
+           << std::setw(16) << wire_stream.str()
            << (res.success ? "" : res.error_message) << "\n";
     }
 
-    ss << "  ------------------------------------------------------------------------------------------------------------------------\n"
+    std::chrono::microseconds total_engine_us{0};
+    std::chrono::microseconds total_wire_us{0};
+    for (const auto& res : report.results) {
+        total_engine_us += res.engine_latency;
+        total_wire_us += res.latency;
+    }
+
+    ss << "  --------------------------------------------------------------------------------------------------------------------------------\n"
        << "  Total Orders Submitted: " << report.total_submitted
        << " | Succeeded: " << report.total_succeeded
-       << " | Failed: " << report.total_failed
-       << " | Total Latency: " << (report.total_execution_time.count() / 1000.0) << " ms\n"
-       << "========================================================================================================================\n\n";
+       << " | Failed: " << report.total_failed << "\n"
+       << "  Engine Dispatch CPU Time: " << total_engine_us.count() << " us ("
+       << std::fixed << std::setprecision(3) << (total_engine_us.count() / 1000.0) << " ms)"
+       << " | Network RTT: " << std::fixed << std::setprecision(1) << (total_wire_us.count() / 1000.0) << " ms"
+       << " | Total Latency: " << std::fixed << std::setprecision(3) << (report.total_execution_time.count() / 1000.0) << " ms\n"
+       << "================================================================================================================================\n\n";
 
     return ss.str();
 }
