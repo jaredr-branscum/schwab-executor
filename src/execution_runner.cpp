@@ -35,23 +35,23 @@ std::string ExecutionRunner::format_telemetry_table(
 ) {
     std::ostringstream ss;
 
-    ss << "\n================================================================================================================================\n"
+    ss << "\n=====================================================================================================================\n"
        << "  [SCHWAB-EXECUTOR] "
        << (is_preview ? "BROKER ORDER PREVIEW VALIDATION (/previewOrder)" : (is_dry_run ? "SIMULATION TELEMETRY (DRY RUN)" : "LIVE BROKER EXECUTION REPORT")) << "\n"
-       << "================================================================================================================================\n"
+       << "=====================================================================================================================\n"
        << "  " << std::left 
-       << std::setw(6)  << "SIDE"
-       << std::setw(10) << "SYMBOL"
-       << std::setw(14) << "TAG"
-       << std::setw(12) << "QUANTITY"
-       << std::setw(12) << "PRICE"
-       << std::setw(16) << "TYPE"
-       << std::setw(12) << "STATUS"
-       << std::setw(22) << "ORDER ID"
-       << std::setw(14) << "ENGINE (us)"
-       << std::setw(16) << "NETWORK RTT (ms)"
+       << std::setw(5)  << "SIDE"
+       << std::setw(7)  << "SYMBOL"
+       << std::setw(12) << "TAG"
+       << std::setw(9)  << "QUANTITY"
+       << std::setw(8)  << "PRICE"
+       << std::setw(7)  << "TYPE"
+       << std::setw(14) << "STATUS"
+       << std::setw(18) << "ORDER ID"
+       << std::setw(12) << "ENGINE (us)"
+       << std::setw(18) << "NETWORK RTT (ms)"
        << "NOTES\n"
-       << "  --------------------------------------------------------------------------------------------------------------------------------\n";
+       << "  -------------------------------------------------------------------------------------------------------------------\n";
 
     for (const auto& res : report.results) {
         std::string side_str(to_string(res.order.side));
@@ -90,17 +90,22 @@ std::string ExecutionRunner::format_telemetry_table(
         }
 
         ss << "  " << std::left
-           << std::setw(6)  << side_str
-           << std::setw(10) << sym_str
-           << std::setw(14) << tag_str
-           << std::setw(12) << qty_stream.str()
-           << std::setw(12) << price_str
-           << std::setw(16) << type_str
-           << std::setw(12) << status_str
-           << std::setw(22) << id_str
-           << std::setw(14) << res.engine_latency.count()
-           << std::setw(16) << wire_stream.str()
-           << (res.success ? "" : res.error_message) << "\n";
+           << std::setw(5)  << side_str
+           << std::setw(7)  << sym_str
+           << std::setw(12) << tag_str
+           << std::setw(9)  << qty_stream.str()
+           << std::setw(8)  << price_str
+           << std::setw(7)  << type_str
+           << std::setw(14) << status_str
+           << std::setw(18) << id_str
+           << std::setw(12) << res.engine_latency.count();
+
+        if (res.success && res.error_message.empty()) {
+            ss << wire_stream.str() << "\n";
+        } else {
+            ss << std::setw(18) << wire_stream.str()
+               << res.error_message << "\n";
+        }
     }
 
     std::chrono::microseconds total_engine_us{0};
@@ -110,7 +115,7 @@ std::string ExecutionRunner::format_telemetry_table(
         total_wire_us += res.latency;
     }
 
-    ss << "  --------------------------------------------------------------------------------------------------------------------------------\n"
+    ss << "  -------------------------------------------------------------------------------------------------------------------\n"
        << "  Total Orders Submitted: " << report.total_submitted
        << " | Succeeded: " << report.total_succeeded
        << " | Failed: " << report.total_failed << "\n"
@@ -118,7 +123,7 @@ std::string ExecutionRunner::format_telemetry_table(
        << std::fixed << std::setprecision(3) << (total_engine_us.count() / 1000.0) << " ms)"
        << " | Network RTT: " << std::fixed << std::setprecision(1) << (total_wire_us.count() / 1000.0) << " ms"
        << " | Total Latency: " << std::fixed << std::setprecision(3) << (report.total_execution_time.count() / 1000.0) << " ms\n"
-       << "================================================================================================================================\n\n";
+       << "=====================================================================================================================\n\n";
 
     return ss.str();
 }
