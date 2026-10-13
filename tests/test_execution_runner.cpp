@@ -70,6 +70,10 @@ TEST_CASE("ExecutionRunner Telemetry Table formatting", "[execution_runner]") {
         REQUIRE(table.find("MSFT") != std::string::npos);
         REQUIRE(table.find("SIMULATED") != std::string::npos);
         REQUIRE(table.find("TAG") != std::string::npos);
+        REQUIRE(table.find("ENGINE (us)") != std::string::npos);
+        REQUIRE(table.find("NETWORK RTT (ms)") != std::string::npos);
+        REQUIRE(table.find("Engine Dispatch CPU Time:") != std::string::npos);
+        REQUIRE(table.find("Network RTT:") != std::string::npos);
         REQUIRE(table.find("Total Orders Submitted: 2") != std::string::npos);
     }
 

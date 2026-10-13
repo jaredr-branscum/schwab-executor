@@ -197,7 +197,39 @@ TEST_CASE("ExecutionDriver dry-run interception", "[execution_driver]") {
 
         // Zero network dispatch
         REQUIRE(raw_mock->send_count == 0);
+        REQUIRE(report.results[0].latency.count() == 0);
+        REQUIRE(report.results[0].engine_latency.count() >= 0);
     }
+}
+
+TEST_CASE("ExecutionDriver isolates engine CPU latency from network wire latency", "[execution_driver]") {
+    auto mock = std::make_unique<MockTransport>();
+    MockTransport* raw_mock = mock.get();
+
+    raw_mock->handler = [](const HttpRequest&) {
+        HttpResponse resp;
+        resp.status_code = 201;
+        resp.headers.push_back({"Location", "/orders/12345"});
+        resp.latency = std::chrono::microseconds{5000}; // Simulated 5ms network latency
+        return resp;
+    };
+
+    HttpClient client(std::move(mock));
+    ExecutionDriver driver(client, ExecutionDriverConfig{
+        .account_hash = "LATENCY_HASH",
+        .dry_run = false
+    });
+
+    Order ord;
+    ord.symbol = Symbol{"SPY"};
+    ord.side = OrderSide::Buy;
+    ord.quantity = 10.0;
+    ord.type = OrderType::Market;
+
+    auto result = driver.execute_single_order(ord, "token_123");
+    REQUIRE(result.success);
+    REQUIRE(result.latency == std::chrono::microseconds{5000}); // Network wire RTT preserved
+    REQUIRE(result.engine_latency.count() >= 0);                 // Engine CPU latency tracked separately
 }
 
 TEST_CASE("ExecutionDriver pre-flight input validation", "[execution_driver]") {

@@ -21,7 +21,8 @@ struct OrderExecutionResult {
     bool success{false};
     std::optional<std::string> order_id{std::nullopt};
     std::string error_message{};
-    std::chrono::microseconds latency{0};
+    std::chrono::microseconds latency{0};        // Network HTTP round-trip latency
+    std::chrono::microseconds engine_latency{0}; // Internal engine preparation & processing latency
 };
 
 /**

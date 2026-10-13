@@ -38,6 +38,7 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
     const Order& order,
     std::string_view access_token
 ) {
+    const auto t_start = std::chrono::steady_clock::now();
     OrderExecutionResult result;
     result.order = order;
 
@@ -46,6 +47,7 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
         result.order.status = OrderStatus::Rejected;
         result.http_status = 400;
         result.error_message = "Order fails structural validation";
+        result.engine_latency = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start);
         return result;
     }
 
@@ -54,6 +56,7 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
         result.order.status = OrderStatus::Rejected;
         result.http_status = 400;
         result.error_message = "Account hash is empty";
+        result.engine_latency = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start);
         return result;
     }
 
@@ -62,6 +65,7 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
         result.order.status = OrderStatus::Rejected;
         result.http_status = 401;
         result.error_message = "Access token is empty";
+        result.engine_latency = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start);
         return result;
     }
 
@@ -71,6 +75,7 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
         result.order.status = OrderStatus::Rejected;
         result.http_status = 400;
         result.error_message = "Failed to serialize order into wire JSON";
+        result.engine_latency = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start);
         return result;
     }
 
@@ -80,6 +85,8 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
         result.order.status = OrderStatus::PendingSubmit;
         result.http_status = 200;
         result.order_id = "DRY_RUN_SIMULATED";
+        result.latency = std::chrono::microseconds{0};
+        result.engine_latency = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start);
         return result;
     }
 
@@ -88,10 +95,14 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
     auth_header_buf_.append("Bearer "sv);
     auth_header_buf_.append(access_token);
 
+    const auto t_net_start = std::chrono::steady_clock::now();
+
     // Network Dispatch
     HttpResponse resp = http_client_.post(endpoint_path_, payload_buf_, auth_header_buf_);
     result.http_status = resp.status_code;
     result.latency = resp.latency;
+
+    const auto t_net_end = std::chrono::steady_clock::now();
 
     // Schwab returns HTTP 201 Created on successful order placement, or HTTP 200 OK on previewOrder
     const bool is_accepted = (config_.preview_only && resp.status_code == 200) || (resp.status_code == 201);
@@ -104,6 +115,9 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
         result.order.status = OrderStatus::Rejected;
         result.error_message = OrderSerializer::parse_error_message(resp);
     }
+
+    const auto t_done = std::chrono::steady_clock::now();
+    result.engine_latency = std::chrono::duration_cast<std::chrono::microseconds>((t_net_start - t_start) + (t_done - t_net_end));
 
     return result;
 }
