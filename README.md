@@ -114,7 +114,7 @@ cmake --build build --config Release --parallel
 | :--- | :--- | :--- |
 | `build\Release\schwab_executor.exe` | CLI Executable | Optimized production CLI (sub-millisecond latency, AVX2 enabled) |
 | `build\Debug\schwab_executor.exe` | CLI Executable | Development CLI with debug symbols for debugging |
-| `build\Release\schwab_core.lib` | Static Library | Institutional execution engine core linked by external strategy modules |
+| `build\Release\schwab_core.lib` | Static Library | Execution engine core linked by external strategy modules |
 | `build\tests\Release\run_unit_tests.exe` | Test Suite | Catch2 test suite (107 test cases, 1,654 assertions) |
 
 ---
