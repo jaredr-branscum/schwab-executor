@@ -14,6 +14,7 @@ out/
 .schwab_token*.json
 schwab_token*.json
 *.log
+logs_*/
 
 # Python cache
 __pycache__/

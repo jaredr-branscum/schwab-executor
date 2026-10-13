@@ -30,4 +30,4 @@ target_link_libraries(run_unit_tests PRIVATE
 
 include(CTest)
 include(Catch)
-catch_discover_tests(run_unit_tests)
+catch_discover_tests(run_unit_tests WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
