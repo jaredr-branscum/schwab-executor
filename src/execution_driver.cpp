@@ -15,6 +15,27 @@ ExecutionDriver::ExecutionDriver(HttpClient& http_client, ExecutionDriverConfig 
     auth_header_buf_.reserve(512);
 }
 
+void ExecutionDriver::prewarm() noexcept {
+    try {
+        Order dummy{};
+        dummy.symbol = Symbol("SPY");
+        dummy.side = OrderSide::Buy;
+        dummy.type = OrderType::Limit;
+        dummy.quantity = 100.50;
+        dummy.limit_price = 280.25;
+
+        payload_buf_.clear();
+        OrderSerializer::serialize_order(dummy, payload_buf_);
+        payload_buf_.clear();
+
+        auth_header_buf_.clear();
+        auth_header_buf_.append("Bearer warm_up_virtual_memory_pages_and_cache_lines_token_buffer");
+        auth_header_buf_.clear();
+    } catch (...) {
+        // Safe deterministic recovery during pre-flight warmup
+    }
+}
+
 void ExecutionDriver::set_account_hash(std::string_view hash) {
     while (!hash.empty() && (hash.front() == ' ' || hash.front() == '\t')) {
         hash.remove_prefix(1);
@@ -90,10 +111,13 @@ OrderExecutionResult ExecutionDriver::execute_single_order(
         return result;
     }
 
-    // Format pre-baked Authorization header
-    auth_header_buf_.clear();
-    auth_header_buf_.append("Bearer "sv);
-    auth_header_buf_.append(access_token);
+    // Ensure Authorization header is formatted if not already pre-baked by execute_plan
+    if (auth_header_buf_.size() != 7 + access_token.size() || 
+        !auth_header_buf_.ends_with(access_token)) {
+        auth_header_buf_.clear();
+        auth_header_buf_.append("Bearer "sv);
+        auth_header_buf_.append(access_token);
+    }
 
     const auto t_net_start = std::chrono::steady_clock::now();
 

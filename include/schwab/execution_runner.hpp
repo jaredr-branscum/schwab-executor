@@ -43,6 +43,7 @@ struct ExecutionConfig {
     bool allow_margin_borrowing{false};             ///< If false, blocks buy orders that exceed cash to prevent unintended margin debt
     bool enable_concurrent_dispatch{true};          ///< Enable pre-warmed concurrent worker dispatch for multi-account portfolios
     size_t max_concurrent_workers{16};              ///< Maximum concurrent worker threads (bounds simultaneous threads)
+    bool auto_fetch_quotes{true};                   ///< If false, skips automatic synchronous quote pre-fetching
 };
 
 /**
@@ -157,6 +158,14 @@ public:
         return last_market_quotes_;
     }
 
+    /**
+     * @brief Pre-seeds market data quotes to eliminate synchronous quote fetching on the hot path.
+     */
+    void set_market_quotes(std::vector<Quote> quotes) noexcept {
+        last_market_quotes_ = std::move(quotes);
+        quotes_pre_seeded_ = true;
+    }
+
     [[nodiscard]] const std::optional<BatchReconciliationReport>& last_reconciliation_report() const noexcept {
         return last_reconciliation_report_;
     }
@@ -177,6 +186,7 @@ private:
     TelemetryCallback telemetry_callback_{nullptr};
     std::vector<ExecutionReport> execution_history_{};
     std::vector<Quote> last_market_quotes_{};
+    bool quotes_pre_seeded_{false};
     std::optional<BatchReconciliationReport> last_reconciliation_report_{std::nullopt};
     std::optional<BatchSessionSummary> last_batch_summary_{std::nullopt};
 };

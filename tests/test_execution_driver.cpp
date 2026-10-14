@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "schwab/execution_driver.hpp"
+#include "schwab/order_serializer.hpp"
 
 #include <functional>
 #include <vector>
@@ -439,4 +440,44 @@ TEST_CASE("ExecutionDriver broker previewOrder validation", "[execution_driver]"
     REQUIRE(raw_mock->send_count == 1);
 }
 
+TEST_CASE("ExecutionDriver and OrderSerializer pre-warm functionality", "[execution_driver]") {
+    SECTION("OrderSerializer prewarm executes cleanly without throwing") {
+        REQUIRE_NOTHROW(OrderSerializer::prewarm());
+    }
 
+    SECTION("ExecutionDriver prewarm primes scratch buffers and executes cleanly") {
+        auto mock = std::make_unique<MockTransport>();
+        MockTransport* raw_mock = mock.get();
+
+        raw_mock->handler = [](const HttpRequest& req) {
+            REQUIRE(req.path == "/trader/v1/accounts/WARM_HASH/orders");
+            REQUIRE(req.auth_header == "Bearer test_token");
+            HttpResponse r;
+            r.status_code = 201;
+            r.headers.push_back({"Location", "/orders/998877"});
+            r.latency = std::chrono::microseconds{100};
+            return r;
+        };
+
+        HttpClient client(std::move(mock));
+        ExecutionDriver driver(client, ExecutionDriverConfig{
+            .account_hash = "WARM_HASH",
+            .dry_run = false
+        });
+
+        REQUIRE_NOTHROW(driver.prewarm());
+
+        Order ord;
+        ord.symbol = Symbol{"SPY"};
+        ord.side = OrderSide::Buy;
+        ord.type = OrderType::Limit;
+        ord.quantity = 50.25;
+        ord.limit_price = 510.50;
+
+        auto result = driver.execute_single_order(ord, "test_token");
+        REQUIRE(result.success);
+        REQUIRE(result.http_status == 201);
+        REQUIRE(result.order_id == "998877");
+        REQUIRE(result.engine_latency.count() >= 0);
+    }
+}

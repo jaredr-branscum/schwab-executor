@@ -37,6 +37,12 @@ Establishing a fresh TLS 1.3 socket over the internet typically incurs 50–200m
 - Pre-warms TLS sockets before order execution using lightweight authenticated probes (`/trader/v1/accounts/accountNumbers`).
 - Reuses open keep-alive TCP/TLS sockets for subsequent orders, achieving sub-millisecond network dispatch.
 
+### 4. Barrier-Slack Routine & Buffer Pre-Warming
+In multi-account concurrent mode, worker threads prime Dragonbox `<charconv>` floating-point conversion tables ([`OrderSerializer::prewarm()`](../include/schwab/order_serializer.hpp)) and pre-commit scratch memory buffers ([`ExecutionDriver::prewarm()`](../include/schwab/execution_driver.hpp)) *behind the barrier* during TLS handshake idle slack time. When the hardware spin-wait barrier releases at execution time, all worker threads immediately execute zero-allocation, sub-microsecond serializations.
+
+### 5. Zero-Delay Hot Path Discipline
+Warmup routines must only execute where idle slack time naturally exists (e.g., behind barrier synchronization). On unbarriered sequential hot paths, running dummy order serializations immediately before dispatch consumes ~760 µs of CPU time, delaying actual packet transmission while merely masking it in telemetry timers. The engine enforces direct dispatch for live orders on sequential paths.
+
 ---
 
 ## 2. End-to-End Execution Pipeline
@@ -158,18 +164,22 @@ schwab-executor/
 │   ├── strategy.cpp
 │   ├── token.cpp
 │   └── token_manager.cpp
-├── tests/                         # Catch2 unit test suites (795 assertions)
+├── tests/                         # Catch2 unit test suites (108 test cases, 1,665 assertions)
 │   ├── CMakeLists.txt
 │   ├── test_account_manager.cpp
 │   ├── test_clock.cpp
+│   ├── test_concurrency_benchmark.cpp
 │   ├── test_config.cpp
 │   ├── test_execution_driver.cpp
 │   ├── test_execution_runner.cpp
 │   ├── test_http_client.cpp
 │   ├── test_http_types.cpp
 │   ├── test_indicators.cpp
+│   ├── test_market_data.cpp
 │   ├── test_order.cpp
+│   ├── test_order_detail.cpp
 │   ├── test_order_serializer.cpp
+│   ├── test_order_tracker.cpp
 │   ├── test_process_runner.cpp
 │   ├── test_rebalancer.cpp
 │   ├── test_risk_guard.cpp

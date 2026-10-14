@@ -89,6 +89,11 @@ public:
     void set_dry_run(bool dry_run) noexcept { config_.dry_run = dry_run; }
     void set_account_hash(std::string_view hash);
 
+    /**
+     * @brief Pre-warms scratch buffers, floating-point lookup tables, and memory pages.
+     */
+    void prewarm() noexcept;
+
 private:
     void update_endpoint_path();
 
