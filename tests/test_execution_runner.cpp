@@ -1028,6 +1028,27 @@ TEST_CASE("ExecutionRunner concurrent multi-account dispatch architecture", "[ex
         std::error_code ec;
         std::filesystem::remove(temp_env, ec);
     }
+
+    SECTION("Pre-seeded market quotes and auto_fetch_quotes bypass quote network requests") {
+        ExecutionConfig cfg;
+        cfg.dry_run = true;
+        cfg.auto_fetch_quotes = false;
+
+        ExecutionRunner runner(cfg, strat);
+        
+        Quote q;
+        q.symbol = Symbol{"SPY"};
+        q.bid_price = 500.00;
+        q.ask_price = 500.10;
+        q.last_price = 500.05;
+
+        runner.set_market_quotes({q});
+        REQUIRE(runner.last_market_quotes().size() == 1);
+        REQUIRE(runner.last_market_quotes()[0].symbol == Symbol{"SPY"});
+
+        int exit_code = runner.execute({}, std::nullopt, accounts);
+        REQUIRE(exit_code == 0);
+    }
 }
 
 

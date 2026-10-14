@@ -645,7 +645,9 @@ int ExecutionRunner::execute(
         }
     }
 
-    last_market_quotes_.clear();
+    if (!quotes_pre_seeded_) {
+        last_market_quotes_.clear();
+    }
 
     // Ensure active OAuth session
     std::string access_token;
@@ -806,7 +808,7 @@ int ExecutionRunner::execute(
         }
     }
 
-    if (!pre_quote_symbols.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
+    if (config_.auto_fetch_quotes && !pre_quote_symbols.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
         std::string quote_err;
         auto initial_quotes = MarketDataManager::fetch_quotes_batch(
             http_client_,
@@ -840,6 +842,7 @@ int ExecutionRunner::execute(
             bool has_work{false};
             bool pre_check_failed{false};
             std::unique_ptr<HttpClient> dedicated_client{nullptr};
+            std::unique_ptr<ExecutionDriver> driver{nullptr};
             ExecutionReport report;
             std::string formatted_table;
             std::string formatted_recon_table;
@@ -907,7 +910,7 @@ int ExecutionRunner::execute(
         }
 
         // Batch fetch any additional quotes needed across all accounts
-        if (!additional_symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
+        if (config_.auto_fetch_quotes && !additional_symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
             std::string quote_err;
             auto new_quotes = MarketDataManager::fetch_quotes_batch(
                 http_client_,
@@ -962,13 +965,21 @@ int ExecutionRunner::execute(
             size_t max_workers = config_.max_concurrent_workers > 0 ? config_.max_concurrent_workers : 1;
             size_t num_threads = (std::min)(active_indices.size(), max_workers);
 
-            // Instantiate dedicated transports
+            // Instantiate dedicated transports and execution drivers BEFORE the barrier
             for (size_t idx : active_indices) {
                 if (transport_factory_) {
                     contexts[idx].dedicated_client = std::make_unique<HttpClient>(transport_factory_());
                 } else {
                     contexts[idx].dedicated_client = std::make_unique<HttpClient>();
                 }
+
+                ExecutionDriverConfig driver_cfg;
+                driver_cfg.account_hash = contexts[idx].account.account_hash;
+                driver_cfg.dry_run = config_.dry_run && !config_.preview_only;
+                driver_cfg.preview_only = config_.preview_only;
+                driver_cfg.stop_on_auth_failure = true;
+                driver_cfg.abort_buys_on_sell_failure = true;
+                contexts[idx].driver = std::make_unique<ExecutionDriver>(*contexts[idx].dedicated_client, std::move(driver_cfg));
             }
 
             std::atomic<bool> bell_triggered{false};
@@ -978,10 +989,31 @@ int ExecutionRunner::execute(
 
             for (size_t t_id = 0; t_id < num_threads; ++t_id) {
                 pool.emplace_back([&, t_id]() {
-                    // Pre-warm client for first account on this thread
-                    size_t first_idx = active_indices[t_id];
-                    if ((!config_.dry_run || config_.preview_only) && !contexts[first_idx].dedicated_client->is_connected()) {
-                        contexts[first_idx].dedicated_client->prewarm();
+                    try {
+                        // Pre-warm client and driver scratch buffers for accounts assigned to this thread
+                        for (size_t work_i = t_id; work_i < active_indices.size(); work_i += num_threads) {
+                            size_t idx = active_indices[work_i];
+                            auto& c = contexts[idx];
+                            if ((!config_.dry_run || config_.preview_only) && !c.dedicated_client->is_connected()) {
+                                c.dedicated_client->prewarm();
+                            }
+                            if (c.driver) {
+                                c.driver->prewarm();
+                            }
+                        }
+
+                        // Pre-warm serializer & floating-point tables on this worker thread
+                        OrderSerializer::prewarm();
+                    } catch (const std::exception& ex) {
+                        for (size_t work_i = t_id; work_i < active_indices.size(); work_i += num_threads) {
+                            size_t idx = active_indices[work_i];
+                            contexts[idx].diagnostics.push_back(std::string("  * [PRE-WARM ERROR] Worker thread init exception: ") + ex.what());
+                        }
+                    } catch (...) {
+                        for (size_t work_i = t_id; work_i < active_indices.size(); work_i += num_threads) {
+                            size_t idx = active_indices[work_i];
+                            contexts[idx].diagnostics.push_back("  * [PRE-WARM ERROR] Unknown worker thread init exception");
+                        }
                     }
 
                     ready_count.fetch_add(1, std::memory_order_release);
@@ -1000,22 +1032,11 @@ int ExecutionRunner::execute(
                         size_t idx = active_indices[work_i];
                         auto& c = contexts[idx];
 
-                        // If not first account on this thread, ensure connection is hot
-                        if (work_i != t_id && (!config_.dry_run || config_.preview_only) && !c.dedicated_client->is_connected()) {
-                            c.dedicated_client->prewarm();
-                        }
-
                         c.start_time = std::chrono::steady_clock::now();
-                        ExecutionDriverConfig driver_cfg;
-                        driver_cfg.account_hash = c.account.account_hash;
-                        driver_cfg.dry_run = config_.dry_run && !config_.preview_only;
-                        driver_cfg.preview_only = config_.preview_only;
-                        driver_cfg.stop_on_auth_failure = true;
-                        driver_cfg.abort_buys_on_sell_failure = true;
-
                         try {
-                            ExecutionDriver driver(*c.dedicated_client, driver_cfg);
-                            c.report = driver.execute_plan(c.plan, access_token);
+                            if (c.driver) {
+                                c.report = c.driver->execute_plan(c.plan, access_token);
+                            }
                         } catch (const std::exception& ex) {
                             c.report.all_succeeded = false;
                             c.report.total_failed = c.plan.orders.size();
@@ -1155,6 +1176,7 @@ int ExecutionRunner::execute(
             }
         }
 
+        quotes_pre_seeded_ = false;
         return (batch_summary.failed_accounts == 0) ? 0 : 1;
     }
 
@@ -1234,7 +1256,7 @@ int ExecutionRunner::execute(
         std::vector<std::string> deferred_diagnostics;
         deferred_diagnostics.reserve(raw_orders.size() + 4);
 
-        if (!symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
+        if (config_.auto_fetch_quotes && !symbols_to_quote.empty() && access_token != "SIMULATED_ACCESS_TOKEN" && !access_token.empty()) {
             std::string quote_err;
             auto new_quotes = MarketDataManager::fetch_quotes_batch(
                 http_client_,
@@ -1287,7 +1309,7 @@ int ExecutionRunner::execute(
             continue;
         }
 
-        // Pre-warm HTTP transport and Dispatch Rebalance Plan
+        // Connect HTTP transport if disconnected and Dispatch Rebalance Plan
         if ((!config_.dry_run || config_.preview_only) && !http_client_.is_connected()) {
             http_client_.prewarm();
         }
@@ -1387,6 +1409,7 @@ int ExecutionRunner::execute(
         }
     }
 
+    quotes_pre_seeded_ = false;
     return (batch_summary.failed_accounts == 0) ? 0 : 1;
 }
 

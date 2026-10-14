@@ -187,4 +187,26 @@ std::string OrderSerializer::parse_error_message(const HttpResponse& response) {
     return response.body;
 }
 
+void OrderSerializer::prewarm() noexcept {
+    try {
+        Order dummy{};
+        dummy.symbol = Symbol("SPY");
+        dummy.side = OrderSide::Buy;
+        dummy.type = OrderType::Limit;
+        dummy.quantity = 100.50;
+        dummy.limit_price = 280.25;
+
+        std::string buf;
+        buf.reserve(512);
+        serialize_order(dummy, buf);
+
+        // Pre-warm extract_order_id lookup routines
+        HttpResponse dummy_resp;
+        dummy_resp.headers.push_back(HttpHeader{"Location", "/trader/v1/accounts/mock/orders/12345"});
+        (void)extract_order_id(dummy_resp);
+    } catch (...) {
+        // Deterministic recovery: swallow exceptions during pre-flight warmup
+    }
+}
+
 } // namespace schwab

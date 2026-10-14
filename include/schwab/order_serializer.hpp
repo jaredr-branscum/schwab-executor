@@ -53,6 +53,12 @@ public:
      * @return Human-readable error description, or status text if unparseable.
      */
     [[nodiscard]] static std::string parse_error_message(const HttpResponse& response);
+
+    /**
+     * @brief Pre-warms serializer lookup tables and floating-point conversion routines.
+     * Call during thread pool initialization to eliminate first-order cold start latency.
+     */
+    static void prewarm() noexcept;
 };
 
 } // namespace schwab
