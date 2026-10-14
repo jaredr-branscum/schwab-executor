@@ -193,6 +193,27 @@ int main() {
 }
 ```
 
+#### Advanced: Pre-Seeded Quotes for Sub-Millisecond Open Bell Dispatch
+For time-critical strategies synchronized with market open (e.g. 09:30:00 AM ET), issuing synchronous REST API quote requests after the bell triggers adds 100–300ms of network round-trip delay.
+
+Strategies can bypass the engine's internal quote fetch by setting `auto_fetch_quotes = false` and pre-seeding fresh quotes acquired immediately prior to market open (e.g. during premarket auction cross indications):
+
+```cpp
+schwab::ExecutionConfig config;
+config.session_name = "MARKET_OPEN_DISPATCH";
+// Bypass internal synchronous quote pre-fetching during execute()
+config.auto_fetch_quotes = false;
+
+schwab::ExecutionRunner runner(config, strategy);
+
+// Pre-seed fresh quotes (e.g. acquired at T - 1.0s before the opening bell)
+std::vector<schwab::Quote> pre_open_quotes = ...; 
+runner.set_market_quotes(std::move(pre_open_quotes));
+
+// Dispatches orders immediately upon invocation
+return runner.execute();
+```
+
 This architecture ensures proprietary intellectual property remains 100% confidential in your private codebase while leveraging the shared, tested execution engine.
 
 ---
