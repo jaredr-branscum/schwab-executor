@@ -14,7 +14,9 @@ Security Best Practices Applied:
   to purge sensitive payload buffers from the Python runtime heap.
 """
 
+import argparse
 import gc
+import gzip
 import json
 import os
 from pathlib import Path
@@ -24,45 +26,56 @@ import urllib.request
 
 # Ensure local common module is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DEFAULT_BASE_URL, DEFAULT_TOKEN_PATH, load_env, load_token
+from common import DEFAULT_BASE_URL, DEFAULT_TOKEN_PATH, load_env
+from auth_cli import SchwabAuth, _read_and_decompress
 
 
 def main() -> int:
-    env = load_env(Path(".env"))
-    token_path = Path(env.get("SCHWAB_TOKEN_PATH") or os.environ.get("SCHWAB_TOKEN_PATH", DEFAULT_TOKEN_PATH))
+    parser = argparse.ArgumentParser(description="Schwab-Executor Account Status Helper")
+    parser.add_argument("--env", type=str, default=".env", help="Path to .env configuration file")
+    parser.add_argument("--token-path", type=str, default=None, help="Path to token cache file")
+    args = parser.parse_args()
+
+    env = load_env(Path(args.env))
+    if args.token_path:
+        token_path = Path(args.token_path)
+    else:
+        token_path = Path(env.get("SCHWAB_TOKEN_PATH") or os.environ.get("SCHWAB_TOKEN_PATH", DEFAULT_TOKEN_PATH))
     base_url = (env.get("SCHWAB_BASE_URL") or os.environ.get("SCHWAB_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
 
-    token_data = load_token(token_path)
-    if not token_data:
-        print(f"  [ERROR] Token file '{token_path}' not found or invalid. Please authenticate first.", file=sys.stderr)
-        return 1
-
-    access_token = token_data.get("access_token", "")
-    if not access_token:
-        print("  [ERROR] No access token found in token file.", file=sys.stderr)
-        return 1
-
-    accounts_url = f"{base_url}/trader/v1/accounts"
-    acc_numbers_url = f"{base_url}/trader/v1/accounts/accountNumbers"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-        "User-Agent": "schwab-executor/1.0",
-    }
-
+    access_token = None
+    headers = None
     data = None
-    hash_map = {}
+    hash_map = None
 
     try:
+        auth = SchwabAuth(env_file=Path(args.env), token_path=token_path)
+        try:
+            access_token = auth.get_valid_access_token()
+        except Exception as e:
+            print(f"  [ERROR] Charles Schwab session unauthenticated or token expired: {e}", file=sys.stderr)
+            return 1
+
+        accounts_url = f"{base_url}/trader/v1/accounts"
+        acc_numbers_url = f"{base_url}/trader/v1/accounts/accountNumbers"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": "schwab-executor/1.0",
+        }
+
+        hash_map = {}
         req = urllib.request.Request(accounts_url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            raw_bytes = _read_and_decompress(resp, resp.headers)
+            data = json.loads(raw_bytes.decode("utf-8"))
 
         # Query encrypted account hashes for linked accounts
         try:
             acc_num_req = urllib.request.Request(acc_numbers_url, headers=headers, method="GET")
             with urllib.request.urlopen(acc_num_req, timeout=10) as resp:
-                num_data = json.loads(resp.read().decode("utf-8"))
+                acc_bytes = _read_and_decompress(resp, resp.headers)
+                num_data = json.loads(acc_bytes.decode("utf-8"))
                 if isinstance(num_data, list):
                     for item in num_data:
                         n = item.get("accountNumber")
@@ -101,7 +114,8 @@ def main() -> int:
         return 0
 
     except urllib.error.HTTPError as e:
-        err_msg = e.read().decode("utf-8") if e.fp else str(e)
+        raw_err = _read_and_decompress(e.fp, e.headers)
+        err_msg = raw_err.decode("utf-8", errors="replace") if raw_err else str(e)
         print(f"  [ERROR] Schwab API HTTP {e.code}: {err_msg}", file=sys.stderr)
         return 1
     except Exception as e:
@@ -109,8 +123,6 @@ def main() -> int:
         return 1
     finally:
         # Secure memory hygiene: Explicitly clear sensitive dictionary and token data
-        if token_data and isinstance(token_data, dict):
-            token_data.clear()
         if headers and isinstance(headers, dict):
             headers.clear()
         if hash_map and isinstance(hash_map, dict):

@@ -156,8 +156,8 @@ Execute a dry-run pass with full ASCII telemetry:
 # Display help and usage banner
 schwab_executor --help
 
-# Authenticate or refresh 7-day OAuth session
-schwab_executor auth
+# Authenticate or refresh 7-day OAuth session (add --force to override cache and force re-login)
+schwab_executor auth [--force]
 
 # Inspect token TTLs, pre-baked auth header, and account balances
 schwab_executor status
@@ -181,6 +181,7 @@ schwab_executor execute [--dry-run] [--preview] [--accounts <filter>] [--config 
 
 | Option / Flag | Description |
 | :--- | :--- |
+| `--force` | Forces interactive browser OAuth 2.0 re-authentication regardless of local cache state. |
 | `--dry-run` | Forces simulation mode without sending live broker orders. |
 | `--preview` | Validates orders against live Schwab margin/order engine (`/previewOrder`) without submitting. |
 | `--accounts <filter>` | Multi-account filter: `"all"`, comma-separated numbers/hashes, or last 4 digits (e.g. `1234,5678`). |

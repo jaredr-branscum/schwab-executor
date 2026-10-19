@@ -108,35 +108,51 @@ bool TokenManager::is_authenticated(const std::filesystem::path& path) {
 
 std::optional<OAuthToken> TokenManager::ensure_authenticated(
     const std::filesystem::path& path,
-    const std::string& python_auth_script
+    const std::string& python_auth_script,
+    bool force_reauth
 ) {
     std::filesystem::path actual_path = resolve_token_file(path);
     std::string actual_script = resolve_auth_script(python_auth_script);
 
-    auto token = load_from_file(actual_path);
-    if (token && !token->is_refresh_token_expired()) {
-        // If access token expired but refresh token is valid, attempt auto-refresh
-        if (token->is_access_token_expired()) {
-            std::string refresh_cmd = "python \"" + actual_script + "\" --refresh";
-            auto res = ProcessRunner::execute(refresh_cmd);
-            if (res.exit_code == 0) {
-                return load_from_file(actual_path);
+    std::string path_arg = " --token-path \"" + actual_path.string() + "\"";
+
+    if (!force_reauth) {
+        auto token = load_from_file(actual_path);
+        if (token && !token->is_refresh_token_expired()) {
+            // If access token expired but refresh token is valid, attempt auto-refresh
+            if (token->is_access_token_expired()) {
+                std::string refresh_cmd = "python \"" + actual_script + "\" --refresh" + path_arg;
+                auto res = ProcessRunner::execute(refresh_cmd);
+                if (res.exit_code == 0) {
+                    auto refreshed = load_from_file(actual_path);
+                    if (refreshed && !refreshed->is_access_token_expired()) {
+                        return refreshed;
+                    }
+                }
+                // Auto-refresh failed (e.g. refresh token expired or revoked on server).
+                // Fall through to interactive login.
+            } else {
+                return token;
             }
-        } else {
-            return token;
         }
     }
 
     // Interactive login required via console terminal
     std::cout << "\n[AUTH] No active valid session found. Launching Charles Schwab authentication...\n";
-    std::string login_cmd = "python \"" + actual_script + "\" --login";
+    std::string login_cmd = "python \"" + actual_script + "\" --login --force" + path_arg;
     int exit_code = std::system(login_cmd.c_str());
     if (exit_code != 0) {
         std::cerr << "[ERROR] Charles Schwab authentication was cancelled or failed.\n";
         return std::nullopt;
     }
 
-    return load_from_file(actual_path);
+    auto new_token = load_from_file(actual_path);
+    if (!new_token || new_token->is_access_token_expired()) {
+        std::cerr << "[ERROR] Charles Schwab authentication completed but token is invalid or expired.\n";
+        return std::nullopt;
+    }
+
+    return new_token;
 }
 
 } // namespace schwab

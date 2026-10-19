@@ -9,14 +9,23 @@
 
 namespace {
 
-// RAII helper to temporarily redirect std::cerr during intentional negative tests
-struct ScopedCerrSilencer {
-    std::stringstream dummy;
-    std::streambuf* orig{nullptr};
+// RAII helper to temporarily redirect std::cerr and std::cout during intentional negative tests
+struct ScopedIoSilencer {
+    std::stringstream dummy_err;
+    std::stringstream dummy_out;
+    std::streambuf* orig_err{nullptr};
+    std::streambuf* orig_out{nullptr};
 
-    ScopedCerrSilencer() noexcept : orig(std::cerr.rdbuf(dummy.rdbuf())) {}
-    ~ScopedCerrSilencer() noexcept { std::cerr.rdbuf(orig); }
+    ScopedIoSilencer() noexcept
+        : orig_err(std::cerr.rdbuf(dummy_err.rdbuf())),
+          orig_out(std::cout.rdbuf(dummy_out.rdbuf())) {}
+    ~ScopedIoSilencer() noexcept {
+        std::cerr.rdbuf(orig_err);
+        std::cout.rdbuf(orig_out);
+    }
 };
+
+using ScopedCerrSilencer = ScopedIoSilencer;
 
 } // namespace
 
@@ -127,6 +136,51 @@ TEST_CASE("TokenManager is_authenticated accurately reports session state", "[to
     REQUIRE(token_opt.has_value());
     CHECK(token_opt->access_token == "VALID_ACCESS");
     CHECK(token_opt->auth_header() == "Bearer VALID_ACCESS");
+
+    std::filesystem::remove(temp_path);
+}
+
+TEST_CASE("TokenManager ensure_authenticated does not return expired token if re-auth fails", "[token_manager]") {
+    ScopedCerrSilencer silencer;
+    auto temp_path = std::filesystem::temp_directory_path() / "schwab_expired_token_test.json";
+
+    // Expired access token and expired refresh token
+    {
+        std::ofstream out(temp_path);
+        out << R"({
+            "access_token": "EXPIRED_ACCESS",
+            "refresh_token": "EXPIRED_REFRESH",
+            "expires_at": 1000.0,
+            "refresh_token_expires_at": 1000.0
+        })";
+    }
+
+    // Call ensure_authenticated with a non-existent mock script to simulate failed login
+    auto res = schwab::TokenManager::ensure_authenticated(temp_path, "non_existent_auth_script_xyz.py");
+    CHECK_FALSE(res.has_value());
+
+    std::filesystem::remove(temp_path);
+}
+
+TEST_CASE("TokenManager ensure_authenticated with force_reauth invokes login", "[token_manager]") {
+    ScopedCerrSilencer silencer;
+    auto temp_path = std::filesystem::temp_directory_path() / "schwab_force_auth_test.json";
+
+    double future_refresh = schwab::epoch_seconds_now() + 604800.0;
+    double future_access = schwab::epoch_seconds_now() + 1800.0;
+    {
+        std::ofstream out(temp_path);
+        out << "{\n"
+            << "  \"access_token\": \"VALID_ACCESS\",\n"
+            << "  \"refresh_token\": \"VALID_REFRESH\",\n"
+            << "  \"expires_at\": " << std::to_string(future_access) << ",\n"
+            << "  \"refresh_token_expires_at\": " << std::to_string(future_refresh) << "\n"
+            << "}";
+    }
+
+    // With force_reauth = true and a failing script, it must attempt re-auth rather than returning the cached valid token
+    auto res = schwab::TokenManager::ensure_authenticated(temp_path, "non_existent_auth_script_xyz.py", true);
+    CHECK_FALSE(res.has_value());
 
     std::filesystem::remove(temp_path);
 }
