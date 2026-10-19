@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import base64
+import gzip
 import json
 import os
 from pathlib import Path
@@ -39,6 +40,27 @@ from common import (
 
 OAUTH_AUTHORIZE_PATH = "/v1/oauth/authorize"
 OAUTH_TOKEN_PATH = "/v1/oauth/token"
+
+
+def _read_and_decompress(resp_or_fp, headers=None) -> bytes:
+    """Read response payload and decompress if gzip encoded or starts with gzip magic bytes."""
+    if not resp_or_fp:
+        return b""
+    try:
+        raw = resp_or_fp.read()
+    except Exception:
+        return b""
+    is_gzip = False
+    if headers and headers.get("Content-Encoding", "").lower() == "gzip":
+        is_gzip = True
+    elif len(raw) >= 2 and raw[0] == 0x1F and raw[1] == 0x8B:
+        is_gzip = True
+    if is_gzip:
+        try:
+            return gzip.decompress(raw)
+        except Exception:
+            return raw
+    return raw
 
 
 class SchwabAuth:
@@ -134,24 +156,52 @@ class SchwabAuth:
 
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
+                resp_bytes = _read_and_decompress(resp, resp.headers)
+                try:
+                    resp_data = json.loads(resp_bytes.decode("utf-8"))
+                except json.JSONDecodeError as je:
+                    raise RuntimeError(f"Malformed JSON token response from Schwab: {je}") from je
         except urllib.error.HTTPError as e:
-            err_msg = e.read().decode("utf-8") if e.fp else str(e)
+            raw_err = _read_and_decompress(e.fp, e.headers)
+            err_msg = raw_err.decode("utf-8", errors="replace") if raw_err else str(e)
+
+            # Invalidate cached token if refresh token is rejected, expired, or revoked
+            if payload.get("grant_type") == "refresh_token" and (
+                "invalid_grant" in err_msg
+                or "invalid, expired or revoked" in err_msg.lower()
+                or e.code in (400, 401)
+            ):
+                target_token = existing if existing else self.load_token()
+                if target_token:
+                    target_token["refresh_token_expires_at"] = 0.0
+                    target_token["expires_at"] = 0.0
+                    try:
+                        self.save_token(target_token)
+                    except Exception:
+                        pass
+
             raise RuntimeError(f"HTTP {e.code} Token Error: {err_msg}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Network error connecting to Schwab: {e.reason}") from e
 
         now = time.time()
         # Default 30 min (1800s) for access token
         expires_in = float(resp_data.get("expires_in", 1800))
-        # Default 7 days (604800s) for refresh token
-        refresh_expires_at = (
-            now + 7 * 24 * 3600
-            if "refresh_token" in resp_data
-            else (existing.get("refresh_token_expires_at", now + 7 * 24 * 3600) if existing else now + 7 * 24 * 3600)
-        )
+
+        new_refresh = resp_data.get("refresh_token")
+        if new_refresh:
+            refresh_token = str(new_refresh)
+            refresh_expires_at = now + 7 * 24 * 3600
+        elif existing:
+            refresh_token = existing.get("refresh_token", "")
+            refresh_expires_at = float(existing.get("refresh_token_expires_at", now + 7 * 24 * 3600))
+        else:
+            refresh_token = ""
+            refresh_expires_at = now + 7 * 24 * 3600
 
         token_record = {
             "access_token": resp_data["access_token"],
-            "refresh_token": resp_data.get("refresh_token", existing.get("refresh_token") if existing else ""),
+            "refresh_token": refresh_token,
             "token_type": resp_data.get("token_type", "Bearer"),
             "expires_at": now + expires_in,
             "refresh_token_expires_at": refresh_expires_at,
@@ -162,14 +212,26 @@ class SchwabAuth:
         return token_record
 
 
-def run_login(auth: SchwabAuth) -> int:
+def run_login(auth: SchwabAuth, force: bool = False) -> int:
     print("\n" + "=" * 80)
     print("  [CHARLES SCHWAB OAUTH 2.0 AUTHENTICATION - SCHWAB-EXECUTOR]")
     print("=" * 80)
 
-    if auth.is_authenticated():
-        print("  * Status: [AUTHENTICATED] Active token cache is valid and ready.")
-        return 0
+    if not force:
+        token = auth.load_token()
+        if token and auth.is_authenticated():
+            expires_at = float(token.get("expires_at", 0.0))
+            if time.time() + 60.0 < expires_at:
+                print("  * Status: [AUTHENTICATED] Active token cache is valid and ready.")
+                print("  * (Use '--force' or 'schwab_executor auth --force' to force re-authentication.)")
+                return 0
+            # If access token is expired, test if refresh token works
+            try:
+                auth.refresh_token()
+                print("  * Status: [AUTHENTICATED] Active session auto-refreshed successfully.")
+                return 0
+            except Exception as e:
+                print(f"  * Cached session expired or cannot be refreshed ({e}). Launching login flow...")
 
     try:
         url = auth.get_authorization_url()
@@ -205,6 +267,7 @@ def run_login(auth: SchwabAuth) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Schwab-Executor Standalone Auth Helper")
     parser.add_argument("--login", action="store_true", help="Run interactive browser OAuth login flow")
+    parser.add_argument("--force", action="store_true", help="Force interactive login even if active token exists")
     parser.add_argument("--check", action="store_true", help="Check if token is valid (exits 0 if valid, 1 if not)")
     parser.add_argument("--refresh", action="store_true", help="Refresh access token")
     parser.add_argument("--get-access-token", action="store_true", help="Print valid Bearer access token string")
@@ -217,8 +280,13 @@ def main() -> int:
 
     if args.check:
         if auth.is_authenticated():
-            print("AUTHENTICATED")
-            return 0
+            try:
+                auth.get_valid_access_token()
+                print("AUTHENTICATED")
+                return 0
+            except Exception:
+                print("UNAUTHENTICATED")
+                return 1
         else:
             print("UNAUTHENTICATED")
             return 1
@@ -241,8 +309,8 @@ def main() -> int:
             print(f"REFRESH_FAILED: {e}", file=sys.stderr)
             return 1
 
-    # Default to login flow if --login or no arguments passed
-    return run_login(auth)
+    # Default to login flow if --login, --force, or no arguments passed
+    return run_login(auth, force=args.force)
 
 
 if __name__ == "__main__":

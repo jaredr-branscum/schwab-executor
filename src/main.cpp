@@ -28,6 +28,7 @@ void print_help() noexcept {
               << "Options:\n"
               << "  --dry-run              Force simulation mode (does not submit live broker orders)\n"
               << "  --preview              Validate orders against live Schwab margin/order engine (/previewOrder) without executing\n"
+              << "  --force                Force interactive OAuth login even if cached token exists\n"
               << "  --accounts <filter>    Account filter: \"all\", comma-separated numbers/hashes (default: SCHWAB_ACCOUNTS in .env)\n"
               << "  --account-hash <hash>  Schwab encrypted account hash override\n"
               << "  --config <path>        Path to .env configuration file (default: .env)\n"
@@ -36,6 +37,7 @@ void print_help() noexcept {
               << "  --track-fills          Poll broker post-dispatch to verify fills and calculate slippage\n"
               << "  --help, -h             Display this help message\n\n"
               << "Examples:\n"
+              << "  schwab_executor auth --force\n"
               << "  schwab_executor status\n"
               << "  schwab_executor execute --dry-run\n"
               << "  schwab_executor execute --preview --accounts all\n"
@@ -58,12 +60,12 @@ std::ostream& operator<<(std::ostream& os, const MaskedView& m) {
     return os << m.str.substr(0, m.prefix) << "..." << m.str.substr(m.str.length() - m.suffix);
 }
 
-int handle_auth(const std::filesystem::path& token_path) {
+int handle_auth(const std::filesystem::path& token_path, bool force = false) {
     std::cout << "\n================================================================================\n"
               << "  [SCHWAB-EXECUTOR] OAUTH 2.0 SESSION MANAGER\n"
               << "================================================================================\n";
 
-    auto token_opt = schwab::TokenManager::ensure_authenticated(token_path);
+    auto token_opt = schwab::TokenManager::ensure_authenticated(token_path, "python/auth_cli.py", force);
     if (!token_opt.has_value()) {
         std::cerr << "  * Status: [FAILED] Authentication could not be completed.\n\n";
         return 1;
@@ -111,7 +113,8 @@ int handle_status(const std::filesystem::path& token_path) {
     std::filesystem::path status_script = "python/status_cli.py";
     if (std::filesystem::exists(status_script)) {
         std::cout << "\n  --- Charles Schwab Account Diagnostics ---\n";
-        auto res = schwab::ProcessRunner::execute("python python/status_cli.py");
+        std::string status_cmd = "python python/status_cli.py --token-path \"" + token_path.string() + "\"";
+        auto res = schwab::ProcessRunner::execute(status_cmd);
         if (res.exit_code == 0) {
             std::cout << res.output;
         } else {
@@ -166,6 +169,7 @@ int main(int argc, char* argv[]) {
     bool force_dry_run = false;
     bool force_preview = false;
     bool force_track_fills = false;
+    bool force_auth = false;
 
     // Zero-allocation CLI argument parsing using string_view slices
     for (int i = 1; i < argc; ++i) {
@@ -191,6 +195,8 @@ int main(int argc, char* argv[]) {
             force_preview = true;
         } else if (arg == "--track-fills") {
             force_track_fills = true;
+        } else if (arg == "--force") {
+            force_auth = true;
         } else if (arg == "auth" || arg == "status" || arg == "execute") {
             mode = arg;
         }
@@ -204,7 +210,7 @@ int main(int argc, char* argv[]) {
     std::filesystem::path token_path(token_path_str);
 
     if (mode == "auth") {
-        return handle_auth(token_path);
+        return handle_auth(token_path, force_auth);
     } else if (mode == "status") {
         return handle_status(token_path);
     } else if (mode == "execute") {

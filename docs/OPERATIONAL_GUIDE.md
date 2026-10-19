@@ -194,13 +194,17 @@ The engine proactively refreshes the access token:
 - Manually via `python python/auth_cli.py --refresh`.
 
 ### Weekly 7-Day Re-Authentication Procedure
-When the 7-day refresh token expires, the operator must re-authenticate:
+When the 7-day refresh token expires (or if revoked by Schwab), the operator must re-authenticate:
 
 1. Run the interactive authenticator:
    ```powershell
-   .\build\Debug\schwab_executor.exe auth
+   .\build\Release\schwab_executor.exe auth
    # Alternatively: python python/auth_cli.py --login
+   # To explicitly force re-authentication even if a cached token exists:
+   .\build\Release\schwab_executor.exe auth --force
    ```
+   > [!NOTE]
+   > If the refresh token has expired or is revoked on Schwab's servers, the engine automatically detects the `invalid_grant` rejection, invalidates stale local timestamps, and immediately launches the interactive browser authorization flow without manual token deletion.
 2. Follow the URL displayed in the console, log into Charles Schwab in your browser, complete 2FA, and click **Agree**.
 3. Copy the URL from the browser's address bar (even if the page shows a blank or unreachable screen) and paste it into the terminal.
 4. The new credentials will be written atomically to `.schwab_token.json`.
@@ -242,10 +246,11 @@ All trade executions emit ASCII telemetry records. When `--telemetry-log` or `SC
 
 ### Issue 1: Authentication Failure (`HTTP 401 Unauthorized`)
 - **Symptom:** CLI displays `[UNAUTHENTICATED] No active session found` or API returns `401 Unauthorized`.
-- **Root Cause:** Refresh token exceeded 7 days or access token could not be refreshed.
+- **Root Cause:** Refresh token exceeded 7 days, was revoked/invalidated by Schwab, or access token could not be refreshed.
 - **Remediation:**
-  1. Run `.\build\Debug\schwab_executor.exe auth` to complete the interactive 2FA login.
-  2. Verify that `.schwab_token.json` was updated with fresh `expires_at` timestamps.
+  1. Run `.\build\Release\schwab_executor.exe auth` (or `.\build\Release\schwab_executor.exe auth --force`) to launch the interactive OAuth 2.0 browser handshake.
+  2. Complete the login and paste the resulting callback URL into the terminal.
+  3. Verify that `.\build\Release\schwab_executor.exe status` reports `* OAuth Session Status : [AUTHENTICATED]`.
 
 ### Issue 2: Pre-Trade Risk Rejection (`RiskGuard`)
 - **Symptom:** Execution halts before orders reach the broker with an error like `Order notional $150,000 exceeds maximum allowable limit of $100,000`.

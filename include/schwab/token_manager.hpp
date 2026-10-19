@@ -47,11 +47,13 @@ public:
      *
      * @param path Path to token file (default: ".schwab_token.json").
      * @param python_auth_script Path to python auth helper (default: "python/auth_cli.py").
+     * @param force_reauth If true, bypasses existing token cache and launches login flow.
      * @return Populated OAuthToken if authenticated, or std::nullopt if login failed.
      */
     static std::optional<OAuthToken> ensure_authenticated(
         const std::filesystem::path& path = ".schwab_token.json",
-        const std::string& python_auth_script = "python/auth_cli.py"
+        const std::string& python_auth_script = "python/auth_cli.py",
+        bool force_reauth = false
     );
 };
 

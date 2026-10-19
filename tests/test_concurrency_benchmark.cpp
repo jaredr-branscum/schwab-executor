@@ -228,7 +228,7 @@ TEST_CASE("Concurrency Benchmark: Multi-Account Portfolio Dispatch Scaling", "[b
         auto start_naive = std::chrono::steady_clock::now();
         {
             std::vector<std::thread> workers;
-            std::vector<bool> worker_succeeded(num_accounts, false);
+            std::vector<uint8_t> worker_succeeded(num_accounts, 0);
             workers.reserve(num_accounts);
 
             for (int i = 0; i < num_accounts; ++i) {
@@ -241,15 +241,15 @@ TEST_CASE("Concurrency Benchmark: Multi-Account Portfolio Dispatch Scaling", "[b
                         .dry_run = false
                     });
                     ExecutionReport report = driver.execute_plan(plans[i], synthetic_token);
-                    worker_succeeded[i] = report.all_succeeded;
+                    worker_succeeded[i] = report.all_succeeded ? 1 : 0;
                 });
             }
 
             for (auto& w : workers) {
                 w.join();
             }
-            for (bool ok : worker_succeeded) {
-                REQUIRE(ok);
+            for (uint8_t ok : worker_succeeded) {
+                REQUIRE(ok == 1);
             }
         }
         auto end_naive = std::chrono::steady_clock::now();
